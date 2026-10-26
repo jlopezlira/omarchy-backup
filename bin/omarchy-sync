@@ -29,7 +29,13 @@ set_config() { # key value
   mkdir -p "$CONFIG_DIR"; touch "$CONFIG"
   if grep -q "^$1=" "$CONFIG"; then sed -i "s|^$1=.*|$1=$2|" "$CONFIG"; else printf '%s=%s\n' "$1" "$2" >> "$CONFIG"; fi
 }
-REPO=$(config_value REPO); REPO="${REPO:-$HOME/omarchy-sync}"; REPO="${REPO/#\~/$HOME}"
+# "~/x" and bare names like "backup" are relative to $HOME, never to the current directory.
+abs_path() {
+  local p="${1/#\~/$HOME}"
+  case "$p" in /*) ;; *) p="$HOME/$p" ;; esac
+  realpath -m "$p"
+}
+REPO=$(config_value REPO); REPO=$(abs_path "${REPO:-$HOME/omarchy-sync}")
 
 EXCLUDES=(
   --exclude='.git' --exclude='backups' --exclude='node_modules' --exclude='__pycache__'
@@ -382,8 +388,14 @@ cmd_init() {
     esac
     shift
   done
-  [ -n "$path" ] || path=$(ask "Where should backups be stored?" "$HOME/omarchy-sync")
-  path="${path/#\~/$HOME}"
+  if [ -z "$path" ]; then
+    echo "Backups are kept in a git repo folder. A plain name like 'my-backup' goes inside $HOME."
+    path=$(ask "Folder for the backup repo" "$HOME/omarchy-sync")
+  fi
+  path=$(abs_path "$path")
+  if [ -t 0 ]; then
+    case "$(ask "Use $path?" "Y")" in [Nn]*) echo "cancelled"; exit 1 ;; esac
+  fi
   mkdir -p "$(dirname "$path")"
 
   if [ -z "$mode" ] && ! git -C "$path" remote get-url origin >/dev/null 2>&1; then
@@ -436,8 +448,9 @@ cmd_init() {
 
 # New machine: everything the backup repo records, then the timer and the bar plugin.
 cmd_setup() {
-  local repo="${1:-$REPO}" omz r d a
-  repo="$(cd "$repo" && pwd)" || { echo "backup repo not found: $repo" >&2; exit 1; }
+  local repo omz r d a
+  repo=$(abs_path "${1:-$REPO}")
+  [ -d "$repo/.git" ] || { echo "backup repo not found: $repo" >&2; exit 1; }
   set_config REPO "$repo"; REPO="$repo"
   cd "$REPO" || exit 1
 
