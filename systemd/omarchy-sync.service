@@ -1,0 +1,11 @@
+[Unit]
+Description=Back up Omarchy (config + software) to git
+
+[Service]
+Type=oneshot
+# Same tools as an interactive shell (mise, fnm, pnpm, uv), so package lists match.
+Environment=PNPM_HOME=%h/.local/share/pnpm
+Environment=PATH=%h/.local/bin:%h/.local/share/mise/shims:%h/.local/share/pnpm:%h/.local/share/pnpm/bin:%h/.local/share/fnm/aliases/default/bin:/usr/local/bin:/usr/bin
+ExecStart=%h/.local/bin/omarchy-sync run
+Nice=10
+IOSchedulingClass=idle

@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "jj.backup-status",
+  "name": "Backup status",
+  "version": "3.0.0",
+  "author": "jj",
+  "license": "MIT",
+  "description": "Machine backup status (omarchy-sync): schedule, back up now, and restore any of the last 5 backups.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BackupPanel.qml"
+  },
+  "barWidget": {
+    "displayName": "Backup status",
+    "description": "Backup status, schedule, back up now and restore.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

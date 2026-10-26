@@ -1,0 +1,69 @@
+{
+  "title": "Backup",
+  "meta.running": "Backing up…",
+  "meta.restoring": "Restoring…",
+  "meta.off": "Automatic backups are off",
+  "meta.pending": {
+    "one": "%1 change not backed up",
+    "other": "%1 changes not backed up"
+  },
+  "meta.unpushed": {
+    "one": "%1 commit not pushed",
+    "other": "%1 commits not pushed"
+  },
+  "meta.ok": "Everything is backed up",
+  "action.backup": "Back up now",
+  "action.restore": "Restore this backup",
+  "stat.last": "Last",
+  "stat.next": "Next",
+  "stat.pending": "Pending",
+  "stat.never": "never",
+  "section.schedule": "Back up every",
+  "schedule.off": "Off",
+  "alert.undocumented": "Apps without install notes: %1",
+  "alert.undocumentedHelp": "Document them in apps/<id>.md so agents can reinstall them.",
+  "alert.timer": "Automatic backups are off. Pick an interval below.",
+  "alert.missing": {
+    "one": "%1 package from the restored backup is not installed",
+    "other": "%1 packages from the restored backup are not installed"
+  },
+  "alert.install": "Install",
+  "section.history": "Last backups",
+  "history.empty": "No backups yet",
+  "history.hint": "Enter restores · o opens on GitHub",
+  "commit.auto": "Automatic backup",
+  "commit.initial": "Initial backup",
+  "commit.snapshot": "Saved before a restore",
+  "commit.restore": "Restored %1",
+  "commit.files": {
+    "one": "%1 file",
+    "other": "%1 files"
+  },
+  "confirm.restore": "Restore your files to the backup from %1 (%2)?\nYour current setup is saved first, so you can undo this.",
+  "confirm.ok": "Restore",
+  "confirm.cancel": "Cancel",
+  "time.now": "just now",
+  "time.min": {
+    "one": "%1 min ago",
+    "other": "%1 min ago"
+  },
+  "time.hour": {
+    "one": "%1 h ago",
+    "other": "%1 h ago"
+  },
+  "time.day": {
+    "one": "%1 day ago",
+    "other": "%1 days ago"
+  },
+  "time.inMin": {
+    "one": "in %1 min",
+    "other": "in %1 min"
+  },
+  "footer.github": "GitHub",
+  "footer.inventory": "Inventory",
+  "footer.agents": "Agent guide",
+  "notify.done": "Backup finished",
+  "notify.failed": "Backup failed. Open the panel for details.",
+  "notify.restored": "Restore finished",
+  "notify.restoreFailed": "Restore failed. Open the panel for details."
+}

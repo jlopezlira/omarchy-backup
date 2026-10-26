@@ -1,0 +1,403 @@
+#!/usr/bin/env bash
+# Back up this Omarchy machine (config + installed software) into a git repo, and restore it.
+# The tool lives in its own repo; the backup repo only holds configuration and instructions.
+# The backup repo path is REPO= in ~/.config/omarchy-sync/config (default ~/omarchy-sync).
+#
+#   omarchy-sync run                      back up now (commit + push)
+#   omarchy-sync status [--json]          state, schedule and the last 5 backups
+#   omarchy-sync log [N]                  last N backups
+#   omarchy-sync interval <15min|30min|1h|6h|12h|24h|off>   change the schedule
+#   omarchy-sync restore <rev> [--dry-run]                  restore files from a backup
+#   omarchy-sync restore-packages [rev]   install packages recorded in a backup (sudo)
+#   omarchy-sync setup [repo]             new machine: packages, files, services, then install
+#   omarchy-sync install | uninstall      timer + bar plugin
+set -uo pipefail
+
+TOOL="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-sync"
+STATE="$STATE_DIR/last.json"
+LOCK="$STATE_DIR/lock"
+CONFIG_DIR="$HOME/.config/omarchy-sync"
+CONFIG="$CONFIG_DIR/config"
+UNIT_DIR="$HOME/.config/systemd/user"
+INTERVALS="15min 30min 1h 6h 12h 24h off"
+mkdir -p "$STATE_DIR"
+
+config_value() { [ -f "$CONFIG" ] && sed -n "s/^$1=//p" "$CONFIG" | tail -1; }
+set_config() { # key value
+  mkdir -p "$CONFIG_DIR"; touch "$CONFIG"
+  if grep -q "^$1=" "$CONFIG"; then sed -i "s|^$1=.*|$1=$2|" "$CONFIG"; else printf '%s=%s\n' "$1" "$2" >> "$CONFIG"; fi
+}
+REPO=$(config_value REPO); REPO="${REPO:-$HOME/omarchy-sync}"; REPO="${REPO/#\~/$HOME}"
+
+EXCLUDES=(
+  --exclude='.git' --exclude='backups' --exclude='node_modules' --exclude='__pycache__'
+  --exclude='auth.json' --exclude='hosts.yml' --exclude='*.keyring' --exclude='.claude.json'
+  --exclude='*.sqlite*' --exclude='*.log' --exclude='*.sock' --exclude='*.lock'
+  --exclude='/.claude/skills/synced' --exclude='omarchy-sync.service' --exclude='omarchy-sync.timer'
+  --exclude='omarchy-sync.timer.d'
+  --exclude='/.codex/skills/.system' --exclude='/.config/terminal/completions'
+  --exclude='herdr-agent-state.*' --exclude='herdr-omp-agent-state.*'
+  --exclude='history.jsonl' --exclude='*cache*' --exclude='*.bak*' --exclude='*.pre-dotfiles'
+)
+MAXSIZE=2M
+
+get_interval() { local v; v=$(config_value INTERVAL); echo "${v:-1h}"; }
+
+copy_files() { # $1 = "" or "-n" (dry run)
+  local dry="$1" entry
+  while IFS= read -r entry; do
+    [[ -z "$entry" || "$entry" == \#* ]] && continue
+    [ -e "$HOME/$entry" ] || continue
+    if [ -d "$HOME/$entry" ]; then
+      ( cd "$HOME" && rsync -aRc $dry --delete --max-size=$MAXSIZE "${EXCLUDES[@]}" --itemize-changes "./$entry/" "$REPO/home/" )
+    else
+      ( cd "$HOME" && rsync -aRc $dry --max-size=$MAXSIZE "${EXCLUDES[@]}" --itemize-changes "./$entry" "$REPO/home/" )
+    fi
+  done < "$REPO/sync.list"
+}
+
+# Write a command's output to a file, but keep the previous file when the command is
+# missing or fails (e.g. npm is not on PATH under systemd): a tool that could not be
+# queried must not look like "everything was uninstalled".
+capture() { # file cmd...
+  local out="$1" tmp; shift
+  tmp=$(mktemp)
+  if "$@" > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+    cmp -s "$tmp" "$out" || mv "$tmp" "$out"
+  fi
+  rm -f "$tmp"
+}
+
+snapshot_software() {
+  local p="$REPO/pkgs"; mkdir -p "$p"
+  capture "$p/native.txt" sh -c 'pacman -Qqen | sort'
+  capture "$p/foreign.txt" sh -c 'pacman -Qqem | sort'
+  capture "$p/mise.txt" mise ls --current
+  capture "$p/npm-global.txt" sh -c 'npm ls -g --depth=0 | tail -n +2'
+  capture "$p/pnpm-global.txt" pnpm ls -g --depth=0
+  capture "$p/uv-tools.txt" uv tool list
+  capture "$p/services-user.txt" sh -c "systemctl --user list-unit-files --state=enabled --no-legend | awk '{print \$1}' | sort"
+  capture "$p/services-system.txt" sh -c "systemctl list-unit-files --state=enabled --no-legend | awk '{print \$1}' | sort"
+  capture "$p/etc-modified.txt" sh -c "pacman -Qii | awk '/^MODIFIED/ {print \$2}' | sort"
+  capture "$p/herdr-integrations.txt" herdr integration status
+  capture "$p/gsettings-interface.txt" gsettings list-recursively org.gnome.desktop.interface
+  capture "$p/dconf.ini" dconf dump /
+  capture "$p/claude-plugins.txt" ls "$HOME/.claude/plugins"
+}
+
+# ---------- Inventory: software that does not come from pacman ----------
+id_from_path() { # absolute path -> app id
+  local p="${1#"$HOME"/}"
+  case "$p" in
+    .local/share/*) p="${p#.local/share/}"; echo "${p%%/*}" ;;
+    .local/bin/*)   p="${p#.local/bin/}";   echo "${p%%/*}" ;;
+    .config/*)      p="${p#.config/}";      echo "${p%%/*}" ;;
+    .*/*)           p="${p#.}";             echo "${p%%/*}" ;;
+    *)              basename "$p" ;;
+  esac
+}
+
+detect_apps() { # prints: id<TAB>path<TAB>source
+  local f t exe
+  for f in "$HOME"/.local/bin/*; do
+    [ -e "$f" ] || continue
+    t=$(readlink -f "$f"); printf '%s\t%s\t%s\n' "$(id_from_path "$t")" "$t" "~/.local/bin/$(basename "$f")"
+  done
+  for f in "$HOME"/.local/share/applications/*.desktop; do
+    [ -e "$f" ] || continue
+    exe=$(sed -n 's/^Exec=//p' "$f" | head -1 | sed -E 's/^"([^"]+)".*/\1/; s/^([^ ]+).*/\1/')
+    case "$exe" in "$HOME"/*) printf '%s\t%s\t%s\n' "$(id_from_path "$exe")" "$exe" "desktop:$(basename "$f")" ;; esac
+  done
+}
+
+documented_ids() { cat "$REPO"/apps/*.md 2>/dev/null | sed -n 's/^ids: *//p' | tr ' ' '\n' | sort -u; }
+
+undocumented_ids() { comm -23 <(detect_apps | cut -f1 | sort -u) <(documented_ids); }
+
+cmd_inventory() {
+  local out="$REPO/INVENTORY.md" id path src ver doc
+  {
+    echo "# Machine inventory"
+    echo
+    echo "> Generated by \`omarchy-sync\` on every backup. Do not edit by hand."
+    echo "> Agents: read \`AGENTS.md\` first."
+    echo
+    echo "## System"
+    echo "- Host: $(hostname) — $(uname -srm)"
+    echo "- Omarchy: $(omarchy version 2>/dev/null | head -1)"
+    echo "- Shell: $SHELL — Terminal: foot — Compositor: Hyprland"
+    echo "- pacman packages: $(pacman -Qqen | wc -l) native, $(pacman -Qqem | wc -l) foreign/AUR (see \`pkgs/\`)"
+    echo "- Backup schedule: every $(get_interval)"
+    echo
+    echo "## Software installed outside pacman"
+    echo "Each row needs its own install. Steps live in \`apps/<id>.md\`; \`—\` in Doc means it is not documented yet."
+    echo
+    echo "| id | path | source | version | doc |"
+    echo "|----|------|--------|---------|-----|"
+    detect_apps | sort -u | while IFS=$'\t' read -r id path src; do
+      ver=""
+      if [ -x "$path" ] && [ -f "$path" ] && [[ "$path" != *.AppImage ]] && [ "$(head -c4 "$path" 2>/dev/null | tr -d '\0')" = $'\x7f'ELF ]; then
+        ver=$(timeout 3 "$path" --version 2>/dev/null | head -1 | cut -c1-60)
+      fi
+      doc="—"; documented_ids | grep -qx "$id" && doc="apps/…"
+      echo "| $id | \`${path/#$HOME/~}\` | ${src} | ${ver:-?} | $doc |"
+    done
+    echo
+    echo "## Tools by manager"
+    echo '```'; cat "$REPO/pkgs/mise.txt" 2>/dev/null; echo; cat "$REPO/pkgs/uv-tools.txt" 2>/dev/null; echo; cat "$REPO/pkgs/npm-global.txt" 2>/dev/null; echo '```'
+    echo
+    echo "## AI agents and their herdr integration"
+    echo '```'; cat "$REPO/pkgs/herdr-integrations.txt" 2>/dev/null; echo '```'
+    echo
+    echo "## App data that is NOT backed up (sign in again)"
+    for d in "$HOME"/.config/*/; do
+      n=$(basename "$d")
+      grep -qE "^\.config/$n(/|$)" "$REPO/sync.list" || echo "- ~/.config/$n"
+    done
+    echo
+    echo "## Enabled systemd user services"
+    sed 's/^/- /' "$REPO/pkgs/services-user.txt" 2>/dev/null
+  } > "$out"
+}
+
+secret_scan() {
+  # Prints matches when something about to be committed looks like a secret.
+  cd "$REPO" || return 0
+  git add -A >/dev/null 2>&1
+  git diff --cached -U0 | grep -E '^\+[^+]' \
+    | grep -P "(?i)(api[_-]?key|secret|token|passwd|password|bearer)[\"' ]*[:=][\"' ]*(?=[A-Za-z0-9_./+=-]*\d)[A-Za-z0-9_./+=-]{20,}|sk-[A-Za-z0-9]{20,}|gh[pousr]_[A-Za-z0-9]{30,}|-----BEGIN [A-Z ]*PRIVATE KEY" \
+    | head -5
+}
+
+write_state() { # status message push [extra-json]
+  local x="${4:-}"; [ -n "$x" ] || x='{}'
+  jq -n --arg s "$1" --arg m "$2" --arg p "$3" --arg t "$(date -Iseconds)" --argjson x "$x" \
+    '{status:$s,message:$m,push:$p,time:$t} + $x' > "$STATE"
+}
+
+state_field() { [ -f "$STATE" ] && jq -r ".$1 // empty" "$STATE" 2>/dev/null; }
+
+# Commit whatever changed. $1 = commit subject (optional). Assumes the lock is held.
+backup() {
+  local subject="${1:-}" hits n extra
+  cd "$REPO" || return 1
+  copy_files "" >/dev/null
+  snapshot_software
+  cmd_inventory
+  hits=$(secret_scan)
+  if [ -n "$hits" ]; then
+    git reset -q
+    write_state error "Possible secret found; backup aborted" none
+    notify-send -u critical "Backup aborted" "Something looks like a secret. Run: omarchy-sync status" 2>/dev/null
+    echo "$hits" >&2; return 2
+  fi
+  extra=$(jq -n --arg r "$(state_field restoreRev)" 'if $r == "" then {} else {restoreRev:$r} end')
+  if git diff --cached --quiet; then
+    write_state ok "No changes" "$(push_state)" "$extra"; echo "no changes"; return 0
+  fi
+  n=$(git diff --cached --name-only | wc -l)
+  [ -n "$subject" ] || subject="backup: $(date '+%Y-%m-%d %H:%M') ($n files)"
+  git commit -q -m "$subject" || { write_state error "Commit failed" none "$extra"; return 1; }
+  if [ -n "${OMARCHY_SYNC_NOPUSH:-}" ]; then
+    write_state ok "$n files backed up (not pushed)" local "$extra"
+  elif git push -q 2>"$STATE_DIR/push.err"; then
+    write_state ok "$n files backed up" pushed "$extra"
+  else
+    write_state ok "$n files backed up, push failed: $(head -c 120 "$STATE_DIR/push.err" | tr '\n' ' ')" local "$extra"
+  fi
+  echo "backed up $n files"
+}
+
+take_lock() { exec 9>"$LOCK"; flock -n 9 || { echo "a backup is already running" >&2; exit 3; }; }
+
+cmd_run() { take_lock; backup "${1:-}"; }
+
+push_state() {
+  cd "$REPO" || return
+  [ "$(git rev-list --count '@{u}..HEAD' 2>/dev/null || echo 0)" = 0 ] && echo pushed || echo local
+}
+
+pending_count() { copy_files "-n" 2>/dev/null | grep -cE '^(>f|<f|\*deleting)' ; }
+
+missing_packages() { # $1 = rev whose package list to compare with
+  local rev="${1:-HEAD}"
+  comm -23 <(git -C "$REPO" show "$rev:pkgs/native.txt" 2>/dev/null | sort -u) <(pacman -Qqn | sort -u)
+  comm -23 <(git -C "$REPO" show "$rev:pkgs/foreign.txt" 2>/dev/null | sort -u) <(pacman -Qqm | sort -u)
+}
+
+cmd_status() {
+  cd "$REPO" || exit 1
+  local undoc pending ahead timer next running remote interval rrev missing
+  local last_status=unknown last_msg="" last_time="" last_epoch=0 commits
+  undoc=$(undocumented_ids | jq -R -s -c 'split("\n")|map(select(length>0))')
+  pending=$(pending_count)
+  ahead=$(git rev-list --count '@{u}..HEAD' 2>/dev/null || echo 0)
+  interval=$(get_interval)
+  timer=$(systemctl --user is-active omarchy-sync.timer 2>/dev/null || true)
+  next=$(systemctl --user list-timers omarchy-sync.timer -o json 2>/dev/null | jq -r '.[0].next // 0 | . / 1000000 | floor' 2>/dev/null || echo 0)
+  running=false; systemctl --user is-active -q omarchy-sync.service 2>/dev/null && running=true
+  flock -n "$LOCK" true 2>/dev/null || running=true
+  remote=$(git remote get-url origin 2>/dev/null | sed -E 's#^git@github.com:#https://github.com/#; s#\.git$##')
+  if [ -f "$STATE" ]; then
+    last_status=$(jq -r .status "$STATE"); last_msg=$(jq -r .message "$STATE"); last_time=$(jq -r .time "$STATE")
+    last_epoch=$(date -d "$last_time" +%s 2>/dev/null || echo 0)
+  fi
+  rrev=$(state_field restoreRev)
+  missing=$(missing_packages "${rrev:-HEAD}" | jq -R -s -c 'split("\n")|map(select(length>0))')
+  commits=$(git log -5 --format='@@%h%x09%ct%x09%cr%x09%s' --shortstat \
+    | awk -F'\t' '/^@@/ {if (h) print h "\t" f; sub(/^@@/,""); h=$0; f=0; next}
+                  /files? changed/ {f=$0+0} END {if (h) print h "\t" f}' \
+    | jq -R -s -c 'split("\n")|map(select(length>0)|split("\t")|{hash:.[0],epoch:(.[1]|tonumber),when:.[2],subject:.[3],files:(.[4]|tonumber)})')
+  if [ "${1:-}" = "--json" ]; then
+    jq -n --arg st "$last_status" --arg msg "$last_msg" --arg time "$last_time" --argjson lastEpoch "$last_epoch" \
+      --argjson pending "$pending" --argjson ahead "$ahead" --arg timer "$timer" --argjson next "${next:-0}" \
+      --arg interval "$interval" --arg intervals "$INTERVALS" --argjson running "$running" --arg remote "$remote" \
+      --argjson undoc "$undoc" --argjson missing "$missing" --arg rrev "$rrev" --argjson commits "$commits" \
+      '{status:$st,message:$msg,time:$time,lastEpoch:$lastEpoch,pending:$pending,unpushed:$ahead,timer:$timer,
+        nextEpoch:$next,interval:$interval,intervals:($intervals|split(" ")),running:$running,remote:$remote,
+        undocumented:$undoc,missingPackages:$missing,restoreRev:$rrev,commits:$commits}'
+  else
+    echo "Last backup    : $last_time ($last_status) $last_msg"
+    echo "Schedule       : every $interval ($timer)$([ "${next:-0}" -gt 0 ] && date -d "@$next" '+, next at %H:%M')"
+    echo "Not backed up  : $pending files    Not pushed: $ahead commits"
+    echo "Undocumented   : $(jq -r 'if length == 0 then "none" else join(" ") end' <<<"$undoc")"
+    echo "Missing pkgs   : $(jq -r 'if length == 0 then "none" else join(" ") end' <<<"$missing")"
+    echo "Last 5 backups:"; git log -5 --format='  %h  %cr  %s'
+  fi
+}
+
+cmd_log() { git -C "$REPO" log -"${1:-5}" --format='%h  %cd  %s' --date=format:'%Y-%m-%d %H:%M'; }
+
+cmd_interval() {
+  local v="${1:-}"
+  if [ -z "$v" ]; then get_interval; return; fi
+  [[ " $INTERVALS " == *" $v "* ]] || { echo "usage: omarchy-sync interval <${INTERVALS// /|}>" >&2; exit 1; }
+  mkdir -p "$UNIT_DIR/omarchy-sync.timer.d"
+  set_config INTERVAL "$v"
+  if [ "$v" = off ]; then
+    systemctl --user disable --now omarchy-sync.timer >/dev/null 2>&1
+    echo "automatic backups off"; return
+  fi
+  printf '[Timer]\nOnUnitActiveSec=\nOnUnitActiveSec=%s\n' "$v" > "$UNIT_DIR/omarchy-sync.timer.d/interval.conf"
+  systemctl --user daemon-reload
+  systemctl --user enable omarchy-sync.timer >/dev/null 2>&1
+  systemctl --user restart omarchy-sync.timer
+  echo "backing up every $v"
+}
+
+cmd_restore() {
+  local rev="" dry="" arg sha short tmp changed n
+  for arg in "$@"; do
+    case "$arg" in --dry-run|-n) dry="-n" ;; *) rev="$arg" ;; esac
+  done
+  [ -n "$rev" ] || { echo "usage: omarchy-sync restore <rev> [--dry-run]" >&2; exit 1; }
+  sha=$(git -C "$REPO" rev-parse --verify -q "$rev^{commit}") || { echo "unknown backup: $rev" >&2; exit 1; }
+  short=$(git -C "$REPO" rev-parse --short "$sha")
+  git -C "$REPO" cat-file -e "$sha:home" 2>/dev/null || { echo "backup $short has no home/ files" >&2; exit 1; }
+
+  tmp=$(mktemp -d); trap 'rm -rf "$tmp"' RETURN
+  git -C "$REPO" archive "$sha" home | tar -x -C "$tmp"
+
+  if [ -n "$dry" ]; then
+    rsync -ac -n --itemize-changes "$tmp/home/" "$HOME/" | grep -E '^>f' | awk '{print $2}'
+    return
+  fi
+
+  take_lock
+  # Save the current setup first, so the restore itself can be undone.
+  backup "snapshot: before restoring $short" >/dev/null || { echo "could not save the current setup; restore cancelled" >&2; exit 1; }
+
+  changed=$(rsync -ac --itemize-changes "$tmp/home/" "$HOME/" | grep -cE '^>f')
+  hyprctl reload >/dev/null 2>&1 || true
+  herdr server reload-config >/dev/null 2>&1 || true
+
+  n=$(missing_packages "$sha" | wc -l)
+  backup "restore: $short ($changed files)" >/dev/null
+  # restoreRev lets status report packages that backup had and this machine lacks.
+  write_state ok "Restored $short ($changed files)" "$(push_state)" "$(jq -n --arg r "$sha" '{restoreRev:$r}')"
+  echo "restored $short: $changed files"
+  [ "$n" -gt 0 ] && echo "$n packages from that backup are not installed: run 'omarchy-sync restore-packages $short'"
+  return 0
+}
+
+cmd_restore_packages() {
+  local rev="${1:-$(state_field restoreRev)}" native foreign
+  rev="${rev:-HEAD}"
+  native=$(comm -23 <(git -C "$REPO" show "$rev:pkgs/native.txt" | sort -u) <(pacman -Qqn | sort -u))
+  foreign=$(comm -23 <(git -C "$REPO" show "$rev:pkgs/foreign.txt" 2>/dev/null | sort -u) <(pacman -Qqm | sort -u))
+  if [ -z "$native$foreign" ]; then echo "all packages are installed"; return 0; fi
+  [ -n "$native" ] && { echo "==> pacman: $(echo $native)"; sudo pacman -S --needed $native; }
+  [ -n "$foreign" ] && { echo "==> AUR: $(echo $foreign)"; yay -S --needed $foreign; }
+  echo "done. Press Enter to close."; read -r _ || true
+}
+
+cmd_install() {
+  local pl="$HOME/.config/omarchy/plugins/jj.backup-status"
+  mkdir -p "$UNIT_DIR" "$HOME/.local/bin" "$pl"
+  ln -sf "$TOOL/bin/omarchy-sync" "$HOME/.local/bin/omarchy-sync"
+  cp "$TOOL/systemd/omarchy-sync.service" "$TOOL/systemd/omarchy-sync.timer" "$UNIT_DIR/"
+  rsync -a --delete "$TOOL"/plugin/jj.backup-status/ "$pl/"
+  [ -n "$(config_value REPO)" ] || set_config REPO "$REPO"
+  systemctl --user daemon-reload
+  cmd_interval "$(get_interval)" >/dev/null
+  echo "installed: timer (every $(get_interval)) + bar plugin, backing up into $REPO"
+  echo "add the widget with: omarchy bar put jj.backup-status --section right"
+}
+
+# New machine: everything the backup repo records, then the timer and the bar plugin.
+cmd_setup() {
+  local repo="${1:-$REPO}" omz r d a
+  repo="$(cd "$repo" && pwd)" || { echo "backup repo not found: $repo" >&2; exit 1; }
+  set_config REPO "$repo"; REPO="$repo"
+  cd "$REPO" || exit 1
+
+  echo "==> Packages (sudo)"
+  sudo pacman -S --needed --noconfirm - < pkgs/native.txt || echo "(some packages failed; check pkgs/native.txt)"
+  if command -v yay >/dev/null && [ -s pkgs/foreign.txt ]; then
+    echo "==> AUR/foreign packages"
+    yay -S --needed --noconfirm - < pkgs/foreign.txt || echo "(check pkgs/foreign.txt)"
+  fi
+
+  echo "==> Files (existing ones are kept as *.pre-dotfiles)"
+  rsync -a --backup --suffix=.pre-dotfiles home/ "$HOME"/
+
+  echo "==> Oh My Zsh, Powerlevel10k and plugins"
+  omz="$HOME/.local/share/oh-my-zsh"
+  [ -d "$omz" ] || git clone --depth 1 https://github.com/ohmyzsh/ohmyzsh "$omz"
+  for r in romkatv/powerlevel10k zsh-users/zsh-autosuggestions zsh-users/zsh-syntax-highlighting; do
+    d="$omz/custom/$( [[ $r == *powerlevel10k ]] && echo themes || echo plugins )/${r##*/}"
+    [ -d "$d" ] || git clone --depth 1 "https://github.com/$r" "$d" 2>/dev/null || true
+  done
+
+  echo "==> Tools, services and integrations"
+  command -v mise >/dev/null && mise install || true
+  while read -r u; do [ -n "$u" ] && systemctl --user enable "$u" 2>/dev/null || true; done < pkgs/services-user.txt
+  [ -s pkgs/dconf.ini ] && dconf load / < pkgs/dconf.ini || true
+  if command -v herdr >/dev/null; then
+    for a in $(awk -F: '/: (current|outdated)/ {print $1}' pkgs/herdr-integrations.txt); do herdr integration install "$a" || true; done
+  fi
+
+  echo "==> Automatic backup"
+  cmd_install
+  echo "==> Done. Log in again, run gh auth login, then follow AGENTS.md for software outside pacman."
+}
+
+cmd_uninstall() {
+  systemctl --user disable --now omarchy-sync.timer 2>/dev/null
+  rm -rf "$UNIT_DIR"/omarchy-sync.{service,timer} "$UNIT_DIR/omarchy-sync.timer.d" "$HOME/.local/bin/omarchy-sync"
+  systemctl --user daemon-reload
+}
+
+case "${1:-status}" in
+  run) cmd_run ;;
+  status) shift; cmd_status "${1:-}" ;;
+  log) shift; cmd_log "${1:-5}" ;;
+  interval) shift; cmd_interval "${1:-}" ;;
+  restore) shift; cmd_restore "$@" ;;
+  restore-packages) shift; cmd_restore_packages "${1:-}" ;;
+  setup) shift; cmd_setup "${1:-}" ;;
+  install) cmd_install ;;
+  uninstall) cmd_uninstall ;;
+  *) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac
