@@ -29,13 +29,14 @@ Panel {
   property real now: Date.now() / 1000
 
   readonly property bool running: backingUp || restoring || info.running === true
+  readonly property bool unconfigured: info.status === "unconfigured"
   readonly property bool failed: info.status === "error"
-  readonly property bool timerOff: loaded && info.timer !== "active"
+  readonly property bool timerOff: loaded && !unconfigured && info.timer !== "active"
   readonly property var undocumented: info.undocumented || []
   readonly property var commits: info.commits || []
-  readonly property bool problem: failed || timerOff
+  readonly property bool problem: failed || timerOff || unconfigured
   readonly property var missingPackages: info.missingPackages || []
-  readonly property bool hasAlert: problem || undocumented.length > 0 || missingPackages.length > 0
+  readonly property bool hasAlert: !unconfigured && (problem || undocumented.length > 0 || missingPackages.length > 0)
   readonly property var scheduleOptions: {
     var labels = { "15min": "15m", "30min": "30m", "1h": "1h", "6h": "6h", "12h": "12h", "24h": "24h", "off": strings.t("schedule.off") }
     var list = info.intervals && info.intervals.length ? info.intervals : ["15min", "30min", "1h", "6h", "12h", "24h", "off"]
@@ -96,6 +97,7 @@ Panel {
   }
 
   readonly property string heroMeta: {
+    if (unconfigured) return strings.t("meta.unconfigured")
     if (restoring) return strings.t("meta.restoring")
     if (running) return strings.t("meta.running")
     if (failed) return String(info.message || "")
@@ -138,6 +140,11 @@ Panel {
     root.restoring = true
     restoreProc.command = ["omarchy-sync", "restore", String(c.hash)]
     restoreProc.running = true
+  }
+
+  function setUp() {
+    Quickshell.execDetached(["omarchy-launch-floating-terminal-with-presentation", "omarchy-sync init"])
+    root.close()
   }
 
   function installMissing() {
@@ -343,8 +350,52 @@ Panel {
             }
           }
 
+          // ---------- First run ----------
+          BorderSurface {
+            visible: root.unconfigured
+            width: parent.width
+            implicitHeight: setupColumn.implicitHeight + Style.space(28)
+            radius: Style.cornerRadius
+            color: Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.08)
+            borderSpec: Border.controlSpec("normal", root.foreground, root.accent)
+
+            Column {
+              id: setupColumn
+              anchors.centerIn: parent
+              width: parent.width - Style.space(28)
+              spacing: Style.space(10)
+
+              Text {
+                width: parent.width
+                textFormat: Text.PlainText
+                text: strings.t("setup.title")
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                font.bold: true
+                wrapMode: Text.WordWrap
+              }
+              Text {
+                width: parent.width
+                textFormat: Text.PlainText
+                text: strings.t("setup.body")
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                wrapMode: Text.WordWrap
+              }
+              LinkChip {
+                width: parent.width
+                glyph: root.glyphCloud
+                label: strings.t("setup.action")
+                onActivated: root.setUp()
+              }
+            }
+          }
+
           // ---------- Stats ----------
           Row {
+            visible: !root.unconfigured
             width: parent.width
             spacing: Style.space(8)
             readonly property real tileWidth: (width - spacing * 2) / 3
@@ -361,6 +412,7 @@ Panel {
 
           // ---------- Schedule ----------
           Column {
+            visible: !root.unconfigured
             width: parent.width
             spacing: Style.space(8)
 
@@ -478,10 +530,11 @@ Panel {
             }
           }
 
-          PanelSeparator { foreground: root.foreground }
+          PanelSeparator { visible: !root.unconfigured; foreground: root.foreground }
 
           // ---------- History ----------
           Column {
+            visible: !root.unconfigured
             width: parent.width
             spacing: Style.space(6)
 
@@ -536,10 +589,11 @@ Panel {
             }
           }
 
-          PanelSeparator { foreground: root.foreground }
+          PanelSeparator { visible: !root.unconfigured; foreground: root.foreground }
 
           // ---------- Links ----------
           Row {
+            visible: !root.unconfigured
             width: parent.width
             spacing: Style.space(8)
             readonly property real chipWidth: (width - spacing * 2) / 3
@@ -733,7 +787,7 @@ Panel {
       anchors.fill: parent
       hoverEnabled: true
       cursorShape: Qt.PointingHandCursor
-      readonly property bool actionOnly: chip.label !== "" && chip.url === "" && chip.glyph === root.glyphBox
+      readonly property bool actionOnly: chip.url === "" && (chip.glyph === root.glyphBox || root.unconfigured)
       onClicked: chip.url !== "" ? root.openUrl(chip.url) : chip.activated()
     }
     hasCursor: chipMouse.containsMouse

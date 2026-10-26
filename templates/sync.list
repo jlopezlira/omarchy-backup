@@ -1,0 +1,42 @@
+# Paths (relative to $HOME) backed up into home/. A directory is mirrored whole.
+# Only configuration belongs here: no programs, browsers, secrets, caches or databases.
+# Missing paths are skipped, so this list works on any Omarchy machine. Add your own below.
+.zshrc
+.zshenv
+.zprofile
+.bashrc
+.p10k.zsh
+.XCompose
+
+.config/hypr
+.config/omarchy/shell.json
+.config/omarchy/extensions
+.config/omarchy/hooks
+.config/omarchy/themes
+.config/omarchy/branding
+.config/omarchy-sync
+
+.config/alacritty
+.config/foot
+.config/ghostty
+.config/kitty
+.config/starship.toml
+.config/git
+.config/gh/config.yml
+.config/lazygit
+.config/btop
+.config/mise
+.config/herdr/config.toml
+.config/environment.d
+.config/autostart
+.config/mimeapps.list
+.config/user-dirs.dirs
+.config/xdg-terminals.list
+.config/systemd/user
+
+.claude/settings.json
+.codex/config.toml
+.pi/agent/settings.json
+.cursor/argv.json
+
+.local/share/applications

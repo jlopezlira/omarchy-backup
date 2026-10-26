@@ -3,6 +3,7 @@
 # The tool lives in its own repo; the backup repo only holds configuration and instructions.
 # The backup repo path is REPO= in ~/.config/omarchy-sync/config (default ~/omarchy-sync).
 #
+#   omarchy-sync init [path] [--github NAME | --remote URL | --local]   choose where backups go
 #   omarchy-sync run                      back up now (commit + push)
 #   omarchy-sync status [--json]          state, schedule and the last 5 backups
 #   omarchy-sync log [N]                  last N backups
@@ -41,6 +42,9 @@ EXCLUDES=(
   --exclude='history.jsonl' --exclude='*cache*' --exclude='*.bak*' --exclude='*.pre-dotfiles'
 )
 MAXSIZE=2M
+
+repo_ready() { git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 && [ -f "$REPO/sync.list" ]; }
+need_repo() { repo_ready || { echo "no backup location yet: run 'omarchy-sync init'" >&2; exit 4; }; }
 
 get_interval() { local v; v=$(config_value INTERVAL); echo "${v:-1h}"; }
 
@@ -199,7 +203,9 @@ backup() {
   n=$(git diff --cached --name-only | wc -l)
   [ -n "$subject" ] || subject="backup: $(date '+%Y-%m-%d %H:%M') ($n files)"
   git commit -q -m "$subject" || { write_state error "Commit failed" none "$extra"; return 1; }
-  if [ -n "${OMARCHY_SYNC_NOPUSH:-}" ]; then
+  if ! git remote | grep -q .; then
+    write_state ok "$n files backed up (local only, no remote)" local "$extra"
+  elif [ -n "${OMARCHY_SYNC_NOPUSH:-}" ]; then
     write_state ok "$n files backed up (not pushed)" local "$extra"
   elif git push -q 2>"$STATE_DIR/push.err"; then
     write_state ok "$n files backed up" pushed "$extra"
@@ -211,7 +217,7 @@ backup() {
 
 take_lock() { exec 9>"$LOCK"; flock -n 9 || { echo "a backup is already running" >&2; exit 3; }; }
 
-cmd_run() { take_lock; backup "${1:-}"; }
+cmd_run() { need_repo; take_lock; backup "${1:-}"; }
 
 push_state() {
   cd "$REPO" || return
@@ -227,6 +233,17 @@ missing_packages() { # $1 = rev whose package list to compare with
 }
 
 cmd_status() {
+  if ! repo_ready; then
+    if [ "${1:-}" = "--json" ]; then
+      jq -n --arg repo "$REPO" --arg interval "$(get_interval)" --arg intervals "$INTERVALS" \
+        '{status:"unconfigured",message:"No backup location yet",repo:$repo,interval:$interval,
+          intervals:($intervals|split(" ")),pending:0,unpushed:0,timer:"",nextEpoch:0,lastEpoch:0,
+          running:false,remote:"",undocumented:[],missingPackages:[],commits:[]}'
+    else
+      echo "No backup location yet. Run: omarchy-sync init"
+    fi
+    return 0
+  fi
   cd "$REPO" || exit 1
   local undoc pending ahead timer next running remote interval rrev missing
   local last_status=unknown last_msg="" last_time="" last_epoch=0 commits
@@ -254,7 +271,8 @@ cmd_status() {
       --argjson pending "$pending" --argjson ahead "$ahead" --arg timer "$timer" --argjson next "${next:-0}" \
       --arg interval "$interval" --arg intervals "$INTERVALS" --argjson running "$running" --arg remote "$remote" \
       --argjson undoc "$undoc" --argjson missing "$missing" --arg rrev "$rrev" --argjson commits "$commits" \
-      '{status:$st,message:$msg,time:$time,lastEpoch:$lastEpoch,pending:$pending,unpushed:$ahead,timer:$timer,
+      --arg repo "$REPO" \
+      '{repo:$repo,status:$st,message:$msg,time:$time,lastEpoch:$lastEpoch,pending:$pending,unpushed:$ahead,timer:$timer,
         nextEpoch:$next,interval:$interval,intervals:($intervals|split(" ")),running:$running,remote:$remote,
         undocumented:$undoc,missingPackages:$missing,restoreRev:$rrev,commits:$commits}'
   else
@@ -287,6 +305,7 @@ cmd_interval() {
 }
 
 cmd_restore() {
+  need_repo
   local rev="" dry="" arg sha short tmp changed n
   for arg in "$@"; do
     case "$arg" in --dry-run|-n) dry="-n" ;; *) rev="$arg" ;; esac
@@ -345,6 +364,76 @@ cmd_install() {
   echo "add the widget with: omarchy bar put jj.backup-status --section right"
 }
 
+ask() { # prompt default -> answer (default when not interactive)
+  local a=""
+  if [ -t 0 ]; then read -r -p "$1 [$2]: " a || true; fi
+  echo "${a:-$2}"
+}
+
+# Choose where backups go: an existing repo, a new local repo, and optionally a private GitHub repo.
+cmd_init() {
+  local path="" mode="" target="" arg
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --github) mode=github; target="${2:-}"; shift ;;
+      --remote) mode=remote; target="${2:-}"; shift ;;
+      --local)  mode=local ;;
+      *) path="$1" ;;
+    esac
+    shift
+  done
+  [ -n "$path" ] || path=$(ask "Where should backups be stored?" "$HOME/omarchy-sync")
+  path="${path/#\~/$HOME}"
+  mkdir -p "$(dirname "$path")"
+
+  if [ -z "$mode" ] && ! git -C "$path" remote get-url origin >/dev/null 2>&1; then
+    echo "Where should the backup be pushed?"
+    echo "  1) a new private GitHub repo (needs gh)"
+    echo "  2) an existing git remote (URL)"
+    echo "  3) nowhere, keep it on this machine only"
+    case "$(ask "Choose" 1)" in
+      1) mode=github ;;
+      2) mode=remote; target=$(ask "Remote URL" "") ;;
+      *) mode=local ;;
+    esac
+  fi
+  if [ "$mode" = remote ] && [ -n "$target" ] && [ ! -e "$path/.git" ] && [ -z "$(ls -A "$path" 2>/dev/null)" ]; then
+    git clone -q "$target" "$path" 2>/dev/null || true   # reuse an existing backup if the remote has one
+  fi
+
+  if ! git -C "$path" rev-parse --git-dir >/dev/null 2>&1; then
+    mkdir -p "$path"; git -C "$path" init -q -b main
+  fi
+  [ -f "$path/sync.list" ] || cp "$TOOL/templates/sync.list" "$path/sync.list"
+  [ -f "$path/AGENTS.md" ] || cp "$TOOL/templates/AGENTS.md" "$path/AGENTS.md"
+  [ -f "$path/.gitignore" ] || cp "$TOOL/templates/gitignore" "$path/.gitignore"
+  mkdir -p "$path/apps" "$path/home" "$path/pkgs"
+
+  set_config REPO "$path"; REPO="$path"
+  if ! git -C "$path" rev-parse -q --verify HEAD >/dev/null; then
+    git -C "$path" add -A && git -C "$path" commit -q -m "Set up omarchy-sync backup"
+  fi
+
+  if ! git -C "$path" remote get-url origin >/dev/null 2>&1; then
+    case "$mode" in
+      github)
+        command -v gh >/dev/null && gh auth status >/dev/null 2>&1 || { echo "gh is not signed in: run 'gh auth login' and then 'omarchy-sync init $path --github NAME'" >&2; exit 1; }
+        [ -n "$target" ] || target=$(ask "GitHub repo name" "$(basename "$path")")
+        gh repo create "$target" --private --source "$path" --push --description "Omarchy machine backup (omarchy-sync)" ;;
+      remote)
+        [ -n "$target" ] || { echo "no remote URL given" >&2; exit 1; }
+        git -C "$path" remote add origin "$target"
+        git -C "$path" push -q -u origin HEAD ;;
+      *) echo "keeping backups on this machine only (add a remote later with git remote add origin <url>)" ;;
+    esac
+  fi
+
+  echo "backups go to $path$(git -C "$path" remote get-url origin >/dev/null 2>&1 && echo " -> $(git -C "$path" remote get-url origin)")"
+  [ -f "$UNIT_DIR/omarchy-sync.timer" ] || cmd_install
+  take_lock; backup "backup: first backup" || true
+  if [ -t 0 ]; then echo "Press Enter to close."; read -r _ || true; fi
+}
+
 # New machine: everything the backup repo records, then the timer and the bar plugin.
 cmd_setup() {
   local repo="${1:-$REPO}" omz r d a
@@ -396,8 +485,9 @@ case "${1:-status}" in
   interval) shift; cmd_interval "${1:-}" ;;
   restore) shift; cmd_restore "$@" ;;
   restore-packages) shift; cmd_restore_packages "${1:-}" ;;
+  init) shift; cmd_init "$@" ;;
   setup) shift; cmd_setup "${1:-}" ;;
   install) cmd_install ;;
   uninstall) cmd_uninstall ;;
-  *) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  *) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

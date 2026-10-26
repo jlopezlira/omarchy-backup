@@ -12,17 +12,26 @@ The backup repo holds only configuration and instructions: dotfiles, package lis
 
 ```bash
 git clone https://github.com/jlopezlira/omarchy-backup ~/Projects/omarchy-backup
-~/Projects/omarchy-backup/bin/omarchy-sync install          # timer + bar plugin
+~/Projects/omarchy-backup/bin/omarchy-sync init          # choose where backups go
 omarchy bar put jj.backup-status --section right
 ```
 
-The backup repo defaults to `~/omarchy-sync`. Set `REPO=` in `~/.config/omarchy-sync/config` to change it. The backup repo must exist and have a remote to push to.
+`init` asks for a folder (default `~/omarchy-sync`) and where to push it:
+
+1. a new **private GitHub repo** (uses `gh`, so run `gh auth login` first),
+2. an **existing git remote** (any URL; if it already holds a backup, it is reused),
+3. **nowhere**, keeping backups on this machine only.
+
+It creates the repo from `templates/` (`sync.list`, `AGENTS.md`, `.gitignore`), saves the location as `REPO=` in `~/.config/omarchy-sync/config`, installs the timer and the bar plugin, and makes the first backup. Without a terminal, pass the answers as flags: `omarchy-sync init ~/omarchy-sync --github my-backup` (or `--remote <url>`, or `--local`). The bar widget shows a **Set up backup** button until a location exists.
+
+To move backups somewhere else later, run `init` again with the new path, or edit `REPO=`.
 
 **New machine:** clone your backup repo, then run `omarchy-sync setup <backup-repo>`. It installs packages, copies the files, enables services, and installs this tool. Then follow the backup repo's `AGENTS.md`.
 
 ## Usage
 
 ```
+omarchy-sync init [path] [--github NAME | --remote URL | --local]
 omarchy-sync run                       back up now (commits and pushes only when something changed)
 omarchy-sync status [--json]           state, schedule, and the last 5 backups
 omarchy-sync log [N]                   last N backups

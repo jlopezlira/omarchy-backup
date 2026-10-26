@@ -1,0 +1,5 @@
+*.bak*
+auth.json
+hosts.yml
+*.keyring
+.claude.json
