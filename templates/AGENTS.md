@@ -13,9 +13,9 @@ This repo holds only configuration and instructions. It is written by the backup
 - Secrets are not in this repo (sign-ins, tokens, cookies). Ask the user to sign in again.
 
 ## New machine
-1. Clone this repo (if private: `gh auth login` first).
-2. Clone the tool: `git clone https://github.com/jlopezlira/omarchy-backup ~/Projects/omarchy-backup`.
-3. Run `~/Projects/omarchy-backup/bin/omarchy-sync setup <path-to-this-repo>`. It installs the packages in `pkgs/`, copies `home/` into `$HOME`, installs `mise` tools, enables services, loads dconf, installs herdr integrations, and installs the backup timer and bar plugin.
+1. Clone the tool: `git clone https://github.com/jlopezlira/omarchy-backup ~/Projects/omarchy-backup`.
+2. Run `~/Projects/omarchy-backup/bin/omarchy-sync restore-github`. It signs in to GitHub, asks which repo and **which backup** to restore (the user must choose), clones it, and runs `setup`.
+3. `setup` installs the packages in `pkgs/`, copies `home/` into `$HOME`, installs `mise` tools, enables services, loads dconf, installs herdr integrations, and installs the backup timer and bar plugin.
 4. Read `INVENTORY.md`. For each row of *Software installed outside pacman*: follow `apps/<id>.md` if it exists. If Doc is `—`, find the official install method for this architecture, install it, verify it, and create `apps/<id>.md` (first line `ids: <id> [other ids]`, then what it is, where it comes from, how to install and verify it, and which data is not backed up).
 5. Check `pkgs/services-system.txt` (system services to enable) and `pkgs/etc-modified.txt` (changed `/etc` files, reference only: ask the user).
 6. Add the bar widget: `omarchy bar put jj.backup-status --section right`.

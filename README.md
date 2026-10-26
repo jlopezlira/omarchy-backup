@@ -26,7 +26,14 @@ It creates the repo from `templates/` (`sync.list`, `AGENTS.md`, `.gitignore`), 
 
 To move backups somewhere else later, run `init` again with the new path, or edit `REPO=`.
 
-**New machine:** clone your backup repo, then run `omarchy-sync setup <backup-repo>`. It installs packages, copies the files, enables services, and installs this tool. Then follow the backup repo's `AGENTS.md`.
+**New machine:** install Omarchy, then:
+
+```bash
+git clone https://github.com/jlopezlira/omarchy-backup ~/Projects/omarchy-backup
+~/Projects/omarchy-backup/bin/omarchy-sync restore-github
+```
+
+It installs `gh` if needed, signs you in to GitHub in the browser, lists your private repos to pick the backup repo, clones it, and shows the last 20 backups so you choose which one to apply. Each backup is named `backup: <date> · <host> · <apps that changed>`, and its commit body lists every file. Then it runs `setup` (packages, files, tools, services, theme, this tool and the bar widget). If the widget is already installed, its first-run panel has a **Restore from GitHub** button that does the same. Finally follow the backup repo's `AGENTS.md`.
 
 ## Usage
 
@@ -39,6 +46,7 @@ omarchy-sync interval <15min|30min|1h|6h|12h|24h|off>
 omarchy-sync restore <rev> [--dry-run] restore files from a backup (the current setup is snapshotted first)
 omarchy-sync restore-packages [rev]    install packages a backup had and this machine lacks (sudo)
 omarchy-sync setup [repo]              rebuild a new machine from a backup repo
+omarchy-sync restore-github [owner/name] [path]  sign in, pick a backup, clone it, setup
 omarchy-sync install | uninstall
 ```
 

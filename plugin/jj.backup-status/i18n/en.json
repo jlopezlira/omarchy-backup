@@ -68,6 +68,7 @@
   "notify.restoreFailed": "Restore failed. Open the panel for details.",
   "meta.unconfigured": "No backup location yet",
   "setup.title": "Choose where your backups go",
-  "setup.body": "Pick a folder for the backup repo and, optionally, a private GitHub repo to push it to. Only configuration and instructions are stored.",
-  "setup.action": "Set up backup"
+  "setup.body": "Pick a folder for the backup repo and, optionally, a private GitHub repo to push it to. Only configuration and instructions are stored. On a new machine, restore your existing backup instead.",
+  "setup.action": "Set up backup",
+  "setup.restore": "Restore from GitHub (new machine)"
 }

@@ -83,6 +83,8 @@ Panel {
     var s = String(subject || "")
     var m
     if (/^backup: .*(inicial|initial)/.test(s)) return strings.t("commit.initial")
+    // backup: <date> · <host> · <what changed>
+    if ((m = /^backup: [^·]+·[^·]+· (.+)$/.exec(s))) return m[1]
     if (/^backup: /.test(s)) return strings.t("commit.auto")
     if (/^snapshot: /.test(s)) return strings.t("commit.snapshot")
     if ((m = /^restore: (\S+)/.exec(s))) return strings.t("commit.restore").arg(m[1])
@@ -144,6 +146,11 @@ Panel {
 
   function setUp() {
     Quickshell.execDetached(["omarchy-launch-floating-terminal-with-presentation", "omarchy-sync init"])
+    root.close()
+  }
+
+  function restoreFromGithub() {
+    Quickshell.execDetached(["omarchy-launch-floating-terminal-with-presentation", "omarchy-sync restore-github"])
     root.close()
   }
 
@@ -389,6 +396,12 @@ Panel {
                 glyph: root.glyphCloud
                 label: strings.t("setup.action")
                 onActivated: root.setUp()
+              }
+              LinkChip {
+                width: parent.width
+                glyph: root.glyphCloud
+                label: strings.t("setup.restore")
+                onActivated: root.restoreFromGithub()
               }
             }
           }

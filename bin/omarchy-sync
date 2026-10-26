@@ -11,6 +11,7 @@
 #   omarchy-sync restore <rev> [--dry-run]                  restore files from a backup
 #   omarchy-sync restore-packages [rev]   install packages recorded in a backup (sudo)
 #   omarchy-sync setup [repo]             new machine: packages, files, services, then install
+#   omarchy-sync restore-github [owner/name] [path]  new machine: sign in to GitHub, clone the backup, setup
 #   omarchy-sync install | uninstall      timer + bar plugin
 set -uo pipefail
 
@@ -94,6 +95,8 @@ snapshot_software() {
   capture "$p/gsettings-interface.txt" gsettings list-recursively org.gnome.desktop.interface
   capture "$p/dconf.ini" dconf dump /
   capture "$p/claude-plugins.txt" ls "$HOME/.claude/plugins"
+  # Active theme and background (theme name, then the background's file name)
+  capture "$p/omarchy-theme.txt" sh -c 'cat "$HOME/.local/state/omarchy/current/theme.name"; basename "$(readlink "$HOME/.local/state/omarchy/current/background")"'
 }
 
 # ---------- Inventory: software that does not come from pacman ----------
@@ -188,6 +191,17 @@ write_state() { # status message push [extra-json]
 
 state_field() { [ -f "$STATE" ] && jq -r ".$1 // empty" "$STATE" 2>/dev/null; }
 
+# What a staged backup touches, by app: "hypr, herdr, pi +2". Reads the index.
+changed_areas() {
+  git diff --cached --name-only | awk -F/ '
+    $1=="home" { a=$2; if (a==".config") a=$3; else if (a==".local") a=$4; sub(/^\./, "", a) }
+    $1=="pkgs" { a="packages" }
+    $1=="apps" { a="install notes" }
+    $1!="home" && $1!="pkgs" && $1!="apps" { next }
+    !seen[a]++ { n++; if (n<=4) list=list (n>1?", ":"") a }
+    END { if (n==0) print "inventory"; else print list (n>4 ? " +" (n-4) : "") }'
+}
+
 # Commit whatever changed. $1 = commit subject (optional). Assumes the lock is held.
 backup() {
   local subject="${1:-}" hits n extra
@@ -207,8 +221,8 @@ backup() {
     write_state ok "No changes" "$(push_state)" "$extra"; echo "no changes"; return 0
   fi
   n=$(git diff --cached --name-only | wc -l)
-  [ -n "$subject" ] || subject="backup: $(date '+%Y-%m-%d %H:%M') ($n files)"
-  git commit -q -m "$subject" || { write_state error "Commit failed" none "$extra"; return 1; }
+  [ -n "$subject" ] || subject="backup: $(date '+%Y-%m-%d %H:%M') · $(hostname) · $(changed_areas)"
+  git commit -q -m "$subject" -m "$(git diff --cached --name-status | head -200)" || { write_state error "Commit failed" none "$extra"; return 1; }
   if ! git remote | grep -q .; then
     write_state ok "$n files backed up (local only, no remote)" local "$extra"
   elif [ -n "${OMARCHY_SYNC_NOPUSH:-}" ]; then
@@ -463,6 +477,7 @@ cmd_setup() {
 
   echo "==> Files (existing ones are kept as *.pre-dotfiles)"
   rsync -a --backup --suffix=.pre-dotfiles home/ "$HOME"/
+  set_config REPO "$REPO"   # the restored config names the old machine's folder
 
   echo "==> Oh My Zsh, Powerlevel10k and plugins"
   omz="$HOME/.local/share/oh-my-zsh"
@@ -486,10 +501,47 @@ cmd_setup() {
   if command -v herdr >/dev/null; then
     for a in $(awk -F: '/: (current|outdated)/ {print $1}' pkgs/herdr-integrations.txt); do herdr integration install "$a" || true; done
   fi
+  if command -v omarchy >/dev/null && [ -s pkgs/omarchy-theme.txt ]; then
+    { read -r t; read -r bg; } < pkgs/omarchy-theme.txt
+    omarchy theme set "$t" || true
+    [ -n "$bg" ] && omarchy theme bg set "$HOME/.local/state/omarchy/current/theme/backgrounds/$bg" || true
+  fi
 
   echo "==> Automatic backup"
   cmd_install
-  echo "==> Done. Log in again, run gh auth login, then follow AGENTS.md for software outside pacman."
+  command -v omarchy >/dev/null && omarchy bar put jj.backup-status --section right >/dev/null 2>&1 || true
+  echo "==> Done. Log in again, then follow AGENTS.md for software outside pacman."
+}
+
+cmd_restore_github() { # [owner/name] [path]: fresh machine -> GitHub sign-in -> clone backup -> setup
+  local repo="${1:-}" path="${2:-}"
+  command -v gh >/dev/null || { echo "==> GitHub CLI (sudo)"; sudo pacman -S --needed --noconfirm github-cli; }
+  gh auth status >/dev/null 2>&1 || gh auth login --hostname github.com --git-protocol https --web || exit 1
+  gh auth setup-git
+  if [ -z "$repo" ]; then
+    echo "Your repos:"; gh repo list --limit 30 --json nameWithOwner,isPrivate -q '.[] | select(.isPrivate) | "  " + .nameWithOwner'
+    repo=$(ask "Backup repo (owner/name)" "")
+    [ -n "$repo" ] || { echo "no repo given" >&2; exit 1; }
+  fi
+  [ -n "$path" ] || path=$(ask "Folder for the backup repo" "$HOME/${repo##*/}")
+  path=$(abs_path "$path")
+  if [ -d "$path/.git" ]; then git -C "$path" pull -q --ff-only || true; else gh repo clone "$repo" "$path" || exit 1; fi
+  [ -f "$path/sync.list" ] || { echo "$repo is not an omarchy-sync backup (no sync.list)" >&2; exit 1; }
+
+  local revs choice rev
+  mapfile -t revs < <(git -C "$path" log -20 --format='%h')
+  echo "Which backup do you want on this machine?"
+  git -C "$path" log -20 --format='%h  %cd  %s' --date=format:'%Y-%m-%d %H:%M' | nl -w3 -s') '
+  choice=$(ask "Number" 1)
+  rev=${revs[$((choice - 1))]:-}
+  [ -n "$rev" ] || { echo "no backup number $choice" >&2; exit 1; }
+  [ "$rev" = "${revs[0]}" ] || git -C "$path" restore --source="$rev" --staged --worktree -- home pkgs
+
+  cmd_setup "$path"
+  if ! git -C "$path" diff --cached --quiet; then
+    git -C "$path" commit -q -m "restore: $rev on $(hostname)" && git -C "$path" push -q || true
+  fi
+  if [ -t 0 ]; then echo "Press Enter to close."; read -r _ || true; fi
 }
 
 cmd_uninstall() {
@@ -507,6 +559,7 @@ case "${1:-status}" in
   restore-packages) shift; cmd_restore_packages "${1:-}" ;;
   init) shift; cmd_init "$@" ;;
   setup) shift; cmd_setup "${1:-}" ;;
+  restore-github) shift; cmd_restore_github "$@" ;;
   install) cmd_install ;;
   uninstall) cmd_uninstall ;;
   *) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
