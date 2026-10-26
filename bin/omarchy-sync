@@ -476,6 +476,13 @@ cmd_setup() {
   command -v mise >/dev/null && mise install || true
   while read -r u; do [ -n "$u" ] && systemctl --user enable "$u" 2>/dev/null || true; done < pkgs/services-user.txt
   [ -s pkgs/dconf.ini ] && dconf load / < pkgs/dconf.ini || true
+  if command -v pnpm >/dev/null && [ -s pkgs/pnpm-global.txt ]; then
+    for a in $(sed -n 's/^[├└]── \(.*\)@[^@]*$/\1/p' pkgs/pnpm-global.txt | grep -vx pnpm); do pnpm add -g "$a" || true; done
+  fi
+  # Pi reads its packages from ~/.pi/agent/settings.json (restored above); install each one
+  if command -v pi >/dev/null && [ -f "$HOME/.pi/agent/settings.json" ]; then
+    for a in $(jq -r '.packages[]? | strings' "$HOME/.pi/agent/settings.json"); do pi install "$a" || true; done
+  fi
   if command -v herdr >/dev/null; then
     for a in $(awk -F: '/: (current|outdated)/ {print $1}' pkgs/herdr-integrations.txt); do herdr integration install "$a" || true; done
   fi
