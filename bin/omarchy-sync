@@ -4,7 +4,8 @@
 # The backup repo path is REPO= in ~/.config/omarchy-sync/config (default ~/omarchy-sync).
 #
 #   omarchy-sync init [path] [--github NAME | --remote URL | --local]   choose where backups go
-#   omarchy-sync run                      back up now (commit + push)
+#   omarchy-sync run                      sync now: bring in other machines' changes, back up, push
+#   omarchy-sync pull [--dry-run] [--from REV]  only bring in other machines' changes (3-way, nothing is overwritten unseen)
 #   omarchy-sync status [--json]          state, schedule and the last 5 backups
 #   omarchy-sync log [N] [machine]        last N backups (of every machine, or only one)
 #   omarchy-sync machines                 machines in this backup repo and their latest backup
@@ -48,8 +49,11 @@ EXCLUDES=(
   --exclude='/.codex/skills/.system' --exclude='/.config/terminal/completions'
   --exclude='herdr-agent-state.*' --exclude='herdr-omp-agent-state.*'
   --exclude='history.jsonl' --exclude='*cache*' --exclude='*.bak*' --exclude='*.pre-dotfiles'
-  --exclude='/.config/hypr/monitors.lua'
 )
+# Files that belong to ONE machine and never travel between machines: its screen, where its
+# backup repo lives, and its per-screen text size (display-profile rewrites it on every screen change).
+MACHINE_LOCAL=(.config/hypr/monitors.lua .config/omarchy-sync/config .config/omarchy/shell.toml)
+for f in "${MACHINE_LOCAL[@]}"; do EXCLUDES+=(--exclude="/$f"); done
 MAXSIZE=2M
 
 MACHINE=$(hostname)
@@ -211,12 +215,19 @@ cmd_inventory() {
   } > "$out"
 }
 
+# Bearer tokens pasted into configs (e.g. an MCP server's Authorization header) are replaced by
+# REDACTED in the copy that gets committed; the live file is never touched.
+redact_secrets() {
+  grep -rlIP 'Bearer [A-Za-z0-9_.~+/=-]{20,}' "$REPO/home" 2>/dev/null \
+    | xargs -r sed -i -E 's/(Bearer )[A-Za-z0-9_.~+\/=-]{20,}/\1REDACTED/g'
+}
+
 secret_scan() {
   # Prints matches when something about to be committed looks like a secret.
   cd "$REPO" || return 0
   git add -A >/dev/null 2>&1
   git diff --cached -U0 | grep -E '^\+[^+]' \
-    | grep -P "(?i)(api[_-]?key|secret|token|passwd|password|bearer)[\"' ]*[:=][\"' ]*(?=[A-Za-z0-9_./+=-]*\d)[A-Za-z0-9_./+=-]{20,}|sk-[A-Za-z0-9]{20,}|gh[pousr]_[A-Za-z0-9]{30,}|-----BEGIN [A-Z ]*PRIVATE KEY" \
+    | grep -P "(?i)(api[_-]?key|secret|token|passwd|password|bearer)[\"' ]*[:=][\"' ]*(?=[A-Za-z0-9_./+=-]*\d)[A-Za-z0-9_./+=-]{20,}|Bearer\s+(?!REDACTED)[A-Za-z0-9_.~+/=-]{20,}|sk-[A-Za-z0-9]{20,}|gh[pousr]_[A-Za-z0-9]{30,}|-----BEGIN [A-Z ]*PRIVATE KEY" \
     | head -5
 }
 
@@ -244,6 +255,8 @@ backup() {
   local subject="${1:-}" hits n extra
   cd "$REPO" || return 1
   copy_files "" >/dev/null
+  for f in "${MACHINE_LOCAL[@]}"; do git rm -q --cached --ignore-unmatch "home/$f" >/dev/null; rm -f "$REPO/home/$f"; done
+  redact_secrets
   snapshot_software
   cmd_inventory
   hits=$(secret_scan)
@@ -297,7 +310,7 @@ push_backup() {
   timeout 60 git fetch -q 2>>"$err" || return 1
   git merge-base --is-ancestor "$up" HEAD && return 1   # not behind: the push failed for another reason
   pre=$(git rev-parse HEAD)
-  git merge -q --no-commit --no-ff -X ours "$up" >/dev/null 2>&1 || true
+  git merge -q --no-commit --no-ff --allow-unrelated-histories -X ours "$up" >/dev/null 2>&1 || true
   git rm -rq --cached --ignore-unmatch home pkgs INVENTORY.md
   git checkout "$pre" -- home pkgs INVENTORY.md
   git clean -fdq home pkgs
@@ -327,7 +340,78 @@ self_update() { # args to re-run with
     || rsync -a --delete "$TOOL/plugin/jj.backup-status/" "$PLUGIN_DIR/"
 }
 
-cmd_run() { need_repo; self_update run "$@"; take_lock; backup "${1:-}"; }
+# Bring in what OTHER machines changed, file by file (3-way against the last state both sides
+# share). A file is replaced only when this machine has not touched it since then; otherwise
+# the local file stays and the other version is kept in $STATE_DIR/conflicts. Every file that
+# gets replaced is first copied to $STATE_DIR/overwritten, so nothing is ever lost.
+# $1 = "" or "-n" (list only). Assumes the lock is held.
+pull_changes() {
+  local dry="${1:-}" up base from rel live stamp tmp mode applied=0 kept=0 hypr=0 ff=0
+  if [ -n "${PULL_FROM:-}" ]; then   # explicit revision (pull --from): no fetch, no fast-forward
+    up=$(git -C "$REPO" rev-parse -q --verify "$PULL_FROM^{commit}") || { echo "unknown revision: $PULL_FROM" >&2; return 1; }
+  else
+    git -C "$REPO" remote | grep -q . || return 0
+    [ -z "${OMARCHY_SYNC_NOPUSH:-}" ] || return 0
+    timeout 60 git -C "$REPO" fetch -q 2>/dev/null || return 0
+    up=$(git -C "$REPO" rev-parse -q --verify '@{u}') || return 0
+  fi
+  git -C "$REPO" merge-base --is-ancestor "$up" HEAD && return 0
+  # Histories that never met (two repos joined for the first time): everything counts as "changed on
+  # both sides" unless identical, so the local file is kept.
+  base=$(git -C "$REPO" merge-base HEAD "$up") || base=$(git -C "$REPO" hash-object -t tree /dev/null)
+  from=$(machine_of "$up"); stamp=$(date +%Y%m%d-%H%M%S); tmp=$(mktemp)
+  [ -n "${PULL_FROM:-}" ] || ! git -C "$REPO" merge-base --is-ancestor HEAD "$up" || ff=1
+
+  while IFS= read -r rel; do
+    rel=${rel#home/}
+    case " ${MACHINE_LOCAL[*]} " in *" $rel "*) continue ;; esac
+    live="$HOME/$rel"
+    mode=$(git -C "$REPO" ls-tree "$up" "home/$rel" | cut -c1-6)
+    [ "$mode" = 120000 ] && continue
+    git -C "$REPO" show "$up:home/$rel" > "$tmp" 2>/dev/null || continue
+    cmp -s "$tmp" "$live" && continue                       # already identical
+    if [ ! -e "$live" ] && ! git -C "$REPO" cat-file -e "$base:home/$rel" 2>/dev/null; then
+      :                                                     # new file from the other machine
+    elif [ -e "$live" ] && git -C "$REPO" show "$base:home/$rel" 2>/dev/null | cmp -s - "$live"; then
+      :                                                     # untouched here since the shared state
+    else
+      kept=$((kept + 1)); echo "keep local   $rel  (changed on both machines)"
+      [ -n "$dry" ] || { mkdir -p "$STATE_DIR/conflicts/$stamp/$(dirname "$rel")"; cp "$tmp" "$STATE_DIR/conflicts/$stamp/$rel.from-$from"; }
+      continue
+    fi
+    applied=$((applied + 1)); echo "from $from   $rel"
+    [ -n "$dry" ] && continue
+    if [ -e "$live" ]; then mkdir -p "$STATE_DIR/overwritten/$stamp/$(dirname "$rel")"; cp -p "$live" "$STATE_DIR/overwritten/$stamp/$rel"; fi
+    mkdir -p "$(dirname "$live")"; cat "$tmp" > "$live"
+    [ "$mode" = 100755 ] && chmod +x "$live"
+    case "$rel" in .config/hypr/*) hypr=1 ;; esac
+  done < <(git -C "$REPO" diff --name-only --diff-filter=AM "$base" "$up" -- home)
+  rm -f "$tmp"
+
+  if [ -z "$dry" ]; then
+    [ "$hypr" = 1 ] && hyprctl reload >/dev/null 2>&1
+    [ "$applied" -gt 0 ] && herdr server reload-config >/dev/null 2>&1
+    # Strictly behind: adopt the other machine's history (the backup that follows records the result).
+    [ "$ff" = 1 ] && git -C "$REPO" merge -q --ff-only "$up" >/dev/null 2>&1
+    if [ "$applied" -gt 0 ] || [ "$kept" -gt 0 ]; then
+      notify-send "Synced from $from" "$applied files applied, $kept kept local (see: omarchy-sync pull --dry-run)" 2>/dev/null
+      echo "synced from $from: $applied applied, $kept kept local"
+    fi
+  fi
+  return 0
+}
+
+cmd_pull() { # [--dry-run] [--from <rev>]
+  need_repo
+  local dry="" arg
+  while [ $# -gt 0 ]; do
+    case "$1" in --dry-run|-n) dry="-n" ;; --from) PULL_FROM="${2:-}"; shift ;; esac
+    shift
+  done
+  take_lock; pull_changes "$dry"
+}
+
+cmd_run() { need_repo; self_update run "$@"; take_lock; pull_changes; backup "${1:-}"; }
 
 push_state() {
   cd "$REPO" || return
@@ -453,10 +537,8 @@ cmd_restore() {
 
   tmp=$(mktemp -d); trap 'rm -rf "$tmp"' RETURN
   git -C "$REPO" archive "$sha" home | tar -x -C "$tmp"
-  # Where the backup repo lives is this machine's business, not the backup's.
-  rm -f "$tmp/home/.config/omarchy-sync/config"
-  # So is its screen: another machine's resolution breaks where clicks land.
-  rm -f "$tmp/home/.config/hypr/monitors.lua"
+  # Screen, backup location and per-screen text size are each machine's own business.
+  for f in "${MACHINE_LOCAL[@]}"; do rm -f "$tmp/home/$f"; done
 
   if [ -n "$dry" ]; then
     rsync -ac -n --itemize-changes "$tmp/home/" "$HOME/" | grep -E '^>f' | awk '{print $2}'
@@ -675,7 +757,8 @@ cmd_uninstall() {
 }
 
 case "${1:-status}" in
-  run) cmd_run ;;
+  run) shift; cmd_run "$@" ;;
+  pull) shift; cmd_pull "$@" ;;
   status) shift; cmd_status "${1:-}" ;;
   log) shift; cmd_log "${1:-5}" "${2:-}" ;;
   machines) cmd_machines ;;
@@ -687,5 +770,5 @@ case "${1:-status}" in
   restore-github) shift; cmd_restore_github "$@" ;;
   install) cmd_install ;;
   uninstall) cmd_uninstall ;;
-  *) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  *) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac
