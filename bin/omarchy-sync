@@ -117,6 +117,22 @@ snapshot_software() {
   capture "$p/claude-plugins.txt" ls "$HOME/.claude/plugins"
   # Active theme and background (theme name, then the background's file name)
   capture "$p/omarchy-theme.txt" sh -c 'cat "$HOME/.local/state/omarchy/current/theme.name"; basename "$(readlink "$HOME/.local/state/omarchy/current/background")"'
+  # Look toggles live in ~/.local/state, not ~/.config, so record the choices instead of the files
+  capture "$p/omarchy-look.txt" sh -c 'omarchy-hyprland-toggle-enabled no-animations && echo animations=off || echo animations=on; echo "transparency=$(omarchy-hyprland-window-transparency)"'
+}
+
+# Apply a backup's look toggles (animations, window transparency), only where they differ
+apply_look() { # rev
+  local look want
+  command -v omarchy >/dev/null || return 0
+  look=$(git -C "$REPO" show "$1:pkgs/omarchy-look.txt" 2>/dev/null) || return 0
+  want=$(sed -n 's/^animations=//p' <<<"$look")
+  if [ "$want" = on ] && omarchy-hyprland-toggle-enabled no-animations; then omarchy toggle animations on >/dev/null 2>&1 || true
+  elif [ "$want" = off ] && ! omarchy-hyprland-toggle-enabled no-animations; then omarchy toggle animations off >/dev/null 2>&1 || true
+  fi
+  want=$(sed -n 's/^transparency=//p' <<<"$look")
+  [ -n "$want" ] && [ "$want" != "$(omarchy-hyprland-window-transparency)" ] && { omarchy hyprland window transparency "$want" >/dev/null 2>&1 || true; }
+  return 0
 }
 
 # ---------- Inventory: software that does not come from pacman ----------
@@ -435,6 +451,7 @@ cmd_restore() {
 
   changed=$(rsync -ac --itemize-changes "$tmp/home/" "$HOME/" | grep -cE '^>f')
   hyprctl reload >/dev/null 2>&1 || true
+  apply_look "$sha"
   herdr server reload-config >/dev/null 2>&1 || true
 
   n=$(missing_packages "$sha" | wc -l)
@@ -592,6 +609,7 @@ cmd_setup() {
     omarchy theme set "$t" || true
     [ -n "$bg" ] && omarchy theme bg set "$HOME/.local/state/omarchy/current/theme/backgrounds/$bg" || true
   fi
+  apply_look HEAD
 
   echo "==> Automatic backup"
   cmd_install
