@@ -70,5 +70,12 @@
   "setup.title": "Choose where your backups go",
   "setup.body": "Pick a folder for the backup repo and, optionally, a private GitHub repo to push it to. Only configuration and instructions are stored. On a new machine, restore your existing backup instead.",
   "setup.action": "Set up backup",
-  "setup.restore": "Restore from GitHub (new machine)"
+  "setup.restore": "Restore from GitHub (new machine)",
+  "incoming.title": "New configuration from %1",
+  "incoming.files": {
+    "one": "%1 file changed",
+    "other": "%1 files changed"
+  },
+  "incoming.apply": "Apply",
+  "incoming.skip": "Not now"
 }

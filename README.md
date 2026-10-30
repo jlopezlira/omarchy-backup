@@ -61,3 +61,17 @@ omarchy-sync install | uninstall
 The paths listed in the backup repo's `sync.list`, minus secrets and caches (`auth.json`, `hosts.yml`, keyrings, sqlite databases, logs, files over 2 MB). Each run also records pacman/AUR packages, mise/npm/pnpm/uv tools, enabled services, dconf, herdr integrations, and an `INVENTORY.md` that flags software installed outside pacman (AppImages, curl installers) so you can document how to reinstall it under `apps/<id>.md`.
 
 Before every commit a scan blocks anything that looks like a token or private key.
+
+## Keeping several machines identical
+
+Every machine backs up into the same repo, and `run` first looks at what the others saved. If another machine changed configuration, **nothing is applied or backed up until you answer**: the bar widget (and a notification) shows what changed with **Apply** / **Not now** buttons, or run `omarchy-sync apply` / `omarchy-sync skip`.
+
+- **Apply** brings in the changed files (3-way per file: a file you also changed stays yours and the other copy is saved in `~/.local/state/omarchy-sync/conflicts/`; every replaced file is first copied to `.../overwritten/`), then sets the theme and GTK appearance, installs Claude Code marketplaces/plugins, and reports missing packages.
+- **Not now** keeps this machine's version; the next change from the other machine asks again.
+- Set `AUTO_APPLY=1` in `~/.config/omarchy-sync/config` to apply without asking.
+- Per-machine files never travel: `hypr/monitors.lua`, `omarchy/shell.toml` (text size follows the screen) and `omarchy-sync/config`.
+- AI agents (Claude, Codex, Cursor, Grok, Pi) sync their instructions, hooks, skills, rules and MCP servers. Sign-ins, sessions and history do not.
+
+### No secrets
+
+Credential files (`.credentials.json`, `auth.json`, keys, `.env`, `.npmrc`...) are never copied. Secret values inside synced configs (Bearer tokens, `api_key = "…"`, `sk-`/`ghp_` keys) are replaced by `REDACTED` in the committed copy only, a file whose other copy was redacted never overwrites your real one, and a backup aborts if anything that looks like a secret is still about to be committed.

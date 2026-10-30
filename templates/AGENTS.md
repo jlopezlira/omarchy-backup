@@ -26,6 +26,10 @@ This repo holds only configuration and instructions. It is written by the backup
 - The current setup is committed first as `snapshot: before restoring <hash>`, so a restore can be undone.
 - Missing packages from that backup: `omarchy-sync restore-packages` (sudo).
 
+## Several machines
+
+All machines share this repo and must end up configured the same (theme, agents, packages, plugins), except work files and per-machine files (`hypr/monitors.lua`, `omarchy/shell.toml`, the sync config). When `omarchy-sync status --json` shows `incoming`, another machine saved new configuration: ask the user, then run `omarchy-sync apply` (or `skip`). Never write secrets into this repo: values shown as `REDACTED` are removed on purpose; the user fills them in per machine.
+
 ## Maintenance
 - `omarchy-sync interval <15min|30min|1h|6h|12h|24h|off>` sets the schedule. Runs commit only when something changed.
 - When a new app is installed outside pacman, `omarchy-sync status` flags it as undocumented: describe it in `apps/<id>.md`.

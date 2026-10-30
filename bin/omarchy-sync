@@ -5,6 +5,7 @@
 #
 #   omarchy-sync init [path] [--github NAME | --remote URL | --local]   choose where backups go
 #   omarchy-sync run                      sync now: bring in other machines' changes, back up, push
+#   omarchy-sync apply | skip             answer 'new configuration from another machine': apply it, or keep mine
 #   omarchy-sync pull [--dry-run] [--from REV]  only bring in other machines' changes (3-way, nothing is overwritten unseen)
 #   omarchy-sync status [--json]          state, schedule and the last 5 backups
 #   omarchy-sync log [N] [machine]        last N backups (of every machine, or only one)
@@ -54,6 +55,13 @@ EXCLUDES=(
 # backup repo lives, and its per-screen text size (display-profile rewrites it on every screen change).
 MACHINE_LOCAL=(.config/hypr/monitors.lua .config/omarchy-sync/config .config/omarchy/shell.toml)
 for f in "${MACHINE_LOCAL[@]}"; do EXCLUDES+=(--exclude="/$f"); done
+# Credentials never travel: sign-in files, keys, certificates, env files, OAuth/token stores.
+EXCLUDES+=(
+  --exclude='.credentials.json' --exclude='credentials*' --exclude='*.pem' --exclude='*.key' --exclude='*.p12'
+  --exclude='id_rsa*' --exclude='id_ed25519*' --exclude='id_ecdsa*' --exclude='.env' --exclude='.env.*'
+  --exclude='*.token' --exclude='tokens.json' --exclude='oauth*.json' --exclude='*secret*.json'
+  --exclude='.netrc' --exclude='*.kdbx' --exclude='.npmrc' --exclude='.pypirc'
+)
 MAXSIZE=2M
 
 MACHINE=$(hostname)
@@ -105,6 +113,15 @@ capture() { # file cmd...
   rm -f "$tmp"
 }
 
+# Which Claude Code marketplaces and plugins are installed, by name, so another machine can
+# install the same ones (the plugin files themselves live in a per-machine cache).
+claude_plugins_json() {
+  local c="$HOME/.claude/plugins"
+  [ -f "$c/installed_plugins.json" ] && [ -f "$c/known_marketplaces.json" ] || return 1
+  jq -S -n --slurpfile i "$c/installed_plugins.json" --slurpfile m "$c/known_marketplaces.json" \
+    '{marketplaces: ($m[0] | with_entries(.value = .value.source)), plugins: ($i[0].plugins | keys)}'
+}
+
 snapshot_software() {
   local p="$REPO/pkgs"; mkdir -p "$p"
   capture "$p/native.txt" sh -c 'pacman -Qqen | sort'
@@ -119,7 +136,7 @@ snapshot_software() {
   capture "$p/herdr-integrations.txt" herdr integration status
   capture "$p/gsettings-interface.txt" gsettings list-recursively org.gnome.desktop.interface
   capture "$p/dconf.ini" dconf dump /
-  capture "$p/claude-plugins.txt" ls "$HOME/.claude/plugins"
+  capture "$p/claude-plugins.json" claude_plugins_json
   # Active theme and background (theme name, then the background's file name)
   capture "$p/omarchy-theme.txt" sh -c 'cat "$HOME/.local/state/omarchy/current/theme.name"; basename "$(readlink "$HOME/.local/state/omarchy/current/background")"'
   # Look toggles live in ~/.local/state, not ~/.config, so record the choices instead of the files
@@ -138,6 +155,68 @@ apply_look() { # rev
   want=$(sed -n 's/^transparency=//p' <<<"$look")
   [ -n "$want" ] && [ "$want" != "$(omarchy-hyprland-window-transparency)" ] && { omarchy hyprland window transparency "$want" >/dev/null 2>&1 || true; }
   return 0
+}
+
+# Everything that is not a plain file: the theme, look toggles, GTK appearance and the AI agents'
+# plugins. Display scale and text size are NOT here: display-profile owns them on each machine.
+# True when the other side changed this repo file since the shared state.
+changed_upstream() { # rev base path
+  [ "$(git -C "$REPO" show "$1:$3" 2>/dev/null)" != "$(git -C "$REPO" show "$2:$3" 2>/dev/null)" ]
+}
+
+apply_extras() { # rev base
+  local rev="$1" base="$2" want cur schema key value now
+  changed_upstream "$rev" "$base" pkgs/omarchy-look.txt && apply_look "$rev"
+  want=$(git -C "$REPO" show "$rev:pkgs/omarchy-theme.txt" 2>/dev/null | head -1)
+  cur=$(cat "$HOME/.local/state/omarchy/current/theme.name" 2>/dev/null)
+  if changed_upstream "$rev" "$base" pkgs/omarchy-theme.txt && [ -n "$want" ] && [ "$want" != "$cur" ] && command -v omarchy >/dev/null; then
+    echo "theme: $cur -> $want"; omarchy theme set "$want" >/dev/null 2>&1 || echo "  could not set theme $want" >&2
+  fi
+  command -v gsettings >/dev/null && while read -r schema key value; do
+    case "$key" in icon-theme|gtk-theme|color-scheme|cursor-theme|cursor-size|accent-color) ;; *) continue ;; esac
+    [ "$(git -C "$REPO" show "$base:pkgs/gsettings-interface.txt" 2>/dev/null | grep -F "$schema $key ")" = "$schema $key $value" ] && continue
+    now=$(gsettings get "$schema" "$key" 2>/dev/null)
+    [ "$now" = "$value" ] || { echo "$key: $now -> $value"; gsettings set "$schema" "$key" "$value" 2>/dev/null; }
+  done < <(git -C "$REPO" show "$rev:pkgs/gsettings-interface.txt" 2>/dev/null)
+  apply_claude_plugins "$rev"
+}
+
+apply_claude_plugins() { # rev
+  local rev="$1" json name source plugin have
+  command -v claude >/dev/null || return 0
+  json=$(git -C "$REPO" show "$rev:pkgs/claude-plugins.json" 2>/dev/null) || return 0
+  have=$(claude plugin marketplace list --json 2>/dev/null | jq -r '.[].name' 2>/dev/null)
+  while IFS=$'\t' read -r name source; do
+    grep -qx "$name" <<<"$have" && continue
+    case "$(jq -r .source <<<"$source")" in
+      github)    source=$(jq -r .repo <<<"$source") ;;
+      git|url)   source=$(jq -r '.url // .repo' <<<"$source") ;;
+      directory) source=$(jq -r .path <<<"$source")
+                 [ -d "$source" ] || { echo "claude marketplace '$name': local folder $source is missing here (publish it to a git remote)" >&2; continue; } ;;
+    esac
+    echo "claude marketplace: $name"; claude plugin marketplace add "$source" >/dev/null 2>&1 || echo "  could not add $name" >&2
+  done < <(jq -r '.marketplaces | to_entries[] | [.key, (.value|tojson)] | @tsv' <<<"$json")
+  have=$(claude plugin list --json 2>/dev/null | jq -r '.[].id' 2>/dev/null)
+  while read -r plugin; do
+    grep -qx "$plugin" <<<"$have" && continue
+    echo "claude plugin: $plugin"; claude plugin install "$plugin" >/dev/null 2>&1 || echo "  could not install $plugin" >&2
+  done < <(jq -r '.plugins[]' <<<"$json")
+}
+
+# Non-file differences between a backup and this machine, one per line (used to ask before applying).
+extras_diff() { # rev base
+  local rev="$1" base="$2" want cur n
+  want=$(git -C "$REPO" show "$rev:pkgs/omarchy-theme.txt" 2>/dev/null | head -1)
+  cur=$(cat "$HOME/.local/state/omarchy/current/theme.name" 2>/dev/null)
+  changed_upstream "$rev" "$base" pkgs/omarchy-theme.txt && [ -n "$want" ] && [ "$want" != "$cur" ] && echo "theme: $cur -> $want"
+  if changed_upstream "$rev" "$base" pkgs/native.txt || changed_upstream "$rev" "$base" pkgs/foreign.txt; then
+    n=$(missing_packages "$rev" | wc -l); [ "$n" -eq 0 ] || echo "$n packages to install"
+  fi
+  if command -v claude >/dev/null && changed_upstream "$rev" "$base" pkgs/claude-plugins.json && git -C "$REPO" cat-file -e "$rev:pkgs/claude-plugins.json" 2>/dev/null; then
+    n=$(comm -23 <(git -C "$REPO" show "$rev:pkgs/claude-plugins.json" | jq -r '.plugins[]' | sort) \
+                 <(claude plugin list --json 2>/dev/null | jq -r '.[].id' | sort) | wc -l)
+    [ "$n" -eq 0 ] || echo "$n Claude plugins to install"
+  fi
 }
 
 # ---------- Inventory: software that does not come from pacman ----------
@@ -215,11 +294,13 @@ cmd_inventory() {
   } > "$out"
 }
 
-# Bearer tokens pasted into configs (e.g. an MCP server's Authorization header) are replaced by
+# Secret values pasted into configs (Bearer tokens, `api_key = "..."`, sk-/ghp_ keys) are replaced by
 # REDACTED in the copy that gets committed; the live file is never touched.
 redact_secrets() {
-  grep -rlIP 'Bearer [A-Za-z0-9_.~+/=-]{20,}' "$REPO/home" 2>/dev/null \
-    | xargs -r sed -i -E 's/(Bearer )[A-Za-z0-9_.~+\/=-]{20,}/\1REDACTED/g'
+  grep -rlIP 'Bearer [A-Za-z0-9_.~+/=-]{20,}|(?i)(api[_-]?key|secret|token|passwd|password)["\x27 ]*[:=]["\x27 ]*(?=[A-Za-z0-9_.\/+=-]*\d)[A-Za-z0-9_.\/+=-]{20,}|sk-[A-Za-z0-9]{20,}|gh[pousr]_[A-Za-z0-9]{30,}' "$REPO/home" 2>/dev/null \
+    | xargs -r perl -pi -e 's/(Bearer )[A-Za-z0-9_.~+\/=-]{20,}/$1REDACTED/g;
+        s/((?:api[_-]?key|secret|token|passwd|password)["\x27 ]*[:=]["\x27 ]*)(?=[A-Za-z0-9_.\/+=-]*\d)[A-Za-z0-9_.\/+=-]{20,}/$1REDACTED/gi;
+        s/sk-[A-Za-z0-9]{20,}/REDACTED/g; s/gh[pousr]_[A-Za-z0-9]{30,}/REDACTED/g'
 }
 
 secret_scan() {
@@ -345,8 +426,10 @@ self_update() { # args to re-run with
 # the local file stays and the other version is kept in $STATE_DIR/conflicts. Every file that
 # gets replaced is first copied to $STATE_DIR/overwritten, so nothing is ever lost.
 # $1 = "" or "-n" (list only). Assumes the lock is held.
+# $1 = "" apply | "-n" list only | "-s" stage: write incoming.json and return 10 when there is something to ask about.
 pull_changes() {
-  local dry="${1:-}" up base from rel live stamp tmp mode applied=0 kept=0 hypr=0 ff=0
+  local dry="${1:-}" stage="" up base from rel live stamp tmp mode applied=0 kept=0 hypr=0 ff=0 files kept_files extras
+  [ "$dry" != "-s" ] || { stage=1; dry="-n"; }
   if [ -n "${PULL_FROM:-}" ]; then   # explicit revision (pull --from): no fetch, no fast-forward
     up=$(git -C "$REPO" rev-parse -q --verify "$PULL_FROM^{commit}") || { echo "unknown revision: $PULL_FROM" >&2; return 1; }
   else
@@ -360,6 +443,7 @@ pull_changes() {
   # both sides" unless identical, so the local file is kept.
   base=$(git -C "$REPO" merge-base HEAD "$up") || base=$(git -C "$REPO" hash-object -t tree /dev/null)
   from=$(machine_of "$up"); stamp=$(date +%Y%m%d-%H%M%S); tmp=$(mktemp)
+  LAST_UP=$up; LAST_BASE=$base; LAST_FROM=$from; files=""; kept_files=""
   [ -n "${PULL_FROM:-}" ] || ! git -C "$REPO" merge-base --is-ancestor HEAD "$up" || ff=1
 
   while IFS= read -r rel; do
@@ -370,16 +454,20 @@ pull_changes() {
     [ "$mode" = 120000 ] && continue
     git -C "$REPO" show "$up:home/$rel" > "$tmp" 2>/dev/null || continue
     cmp -s "$tmp" "$live" && continue                       # already identical
+    if [ -e "$live" ] && grep -q REDACTED "$tmp" && ! grep -q REDACTED "$live"; then
+      kept=$((kept + 1)); kept_files+="$rel"$'\n'; [ -n "$stage" ] || echo "keep local   $rel  (the other copy has secrets removed)"
+      continue
+    fi
     if [ ! -e "$live" ] && ! git -C "$REPO" cat-file -e "$base:home/$rel" 2>/dev/null; then
       :                                                     # new file from the other machine
     elif [ -e "$live" ] && git -C "$REPO" show "$base:home/$rel" 2>/dev/null | cmp -s - "$live"; then
       :                                                     # untouched here since the shared state
     else
-      kept=$((kept + 1)); echo "keep local   $rel  (changed on both machines)"
+      kept=$((kept + 1)); kept_files+="$rel"$'\n'; [ -n "$stage" ] || echo "keep local   $rel  (changed on both machines)"
       [ -n "$dry" ] || { mkdir -p "$STATE_DIR/conflicts/$stamp/$(dirname "$rel")"; cp "$tmp" "$STATE_DIR/conflicts/$stamp/$rel.from-$from"; }
       continue
     fi
-    applied=$((applied + 1)); echo "from $from   $rel"
+    applied=$((applied + 1)); files+="$rel"$'\n'; [ -n "$stage" ] || echo "from $from   $rel"
     [ -n "$dry" ] && continue
     if [ -e "$live" ]; then mkdir -p "$STATE_DIR/overwritten/$stamp/$(dirname "$rel")"; cp -p "$live" "$STATE_DIR/overwritten/$stamp/$rel"; fi
     mkdir -p "$(dirname "$live")"; cat "$tmp" > "$live"
@@ -388,6 +476,22 @@ pull_changes() {
   done < <(git -C "$REPO" diff --name-only --diff-filter=AM "$base" "$up" -- home)
   rm -f "$tmp"
 
+  if [ -n "$stage" ]; then
+    extras=$(extras_diff "$up" "$base")
+    if [ "$up" = "$(cat "$STATE_DIR/declined" 2>/dev/null)" ] || { [ "$applied" -eq 0 ] && [ -z "$extras" ]; }; then
+      rm -f "$STATE_DIR/incoming.json"; return 0
+    fi
+    jq -n --arg from "$from" --arg rev "$up" --arg base "$base" --arg time "$(date -Iseconds)" \
+      --argjson files "$(printf '%s' "$files" | jq -R . | jq -s 'map(select(length>0))')" \
+      --argjson kept "$(printf '%s' "$kept_files" | jq -R . | jq -s 'map(select(length>0))')" \
+      --argjson extras "$(printf '%s\n' "$extras" | jq -R . | jq -s 'map(select(length>0))')" \
+      '{from:$from,rev:$rev,base:$base,time:$time,files:$files,kept:$kept,extras:$extras}' > "$STATE_DIR/incoming.json"
+    if [ "$(cat "$STATE_DIR/notified" 2>/dev/null)" != "$up" ]; then
+      echo "$up" > "$STATE_DIR/notified"
+      notify-send -a "Sync" "New configuration from $from" "$applied files$( [ -n "$extras" ] && printf ', %s' "$(head -1 <<<"$extras")" ). Open the backup widget or run: omarchy-sync apply" 2>/dev/null
+    fi
+    return 10
+  fi
   if [ -z "$dry" ]; then
     [ "$hypr" = 1 ] && hyprctl reload >/dev/null 2>&1
     [ "$applied" -gt 0 ] && herdr server reload-config >/dev/null 2>&1
@@ -411,7 +515,37 @@ cmd_pull() { # [--dry-run] [--from <rev>]
   take_lock; pull_changes "$dry"
 }
 
-cmd_run() { need_repo; self_update run "$@"; take_lock; pull_changes; backup "${1:-}"; }
+# Apply what pull_changes staged (or whatever is upstream now), then back up the result.
+do_apply() {
+  local base="${LAST_BASE:-}" rev from
+  pull_changes ""
+  rev=${LAST_UP:-$(jq -r '.rev // empty' "$STATE_DIR/incoming.json" 2>/dev/null)}
+  base=${LAST_BASE:-$(jq -r '.base // empty' "$STATE_DIR/incoming.json" 2>/dev/null)}
+  [ -n "$rev" ] && apply_extras "$rev" "$base"
+  rm -f "$STATE_DIR/incoming.json"
+  backup "sync: applied ${LAST_FROM:-another machine}'s configuration"
+}
+
+cmd_run() {
+  need_repo; self_update run "$@"; take_lock
+  pull_changes -s; local rc=$?
+  if [ "$rc" = 10 ]; then
+    if [ "$(config_value AUTO_APPLY)" = 1 ]; then do_apply; return; fi
+    echo "new configuration from $(jq -r .from "$STATE_DIR/incoming.json") is waiting: omarchy-sync apply | skip   (nothing was backed up)"
+    write_state ok "New configuration from $(jq -r .from "$STATE_DIR/incoming.json") is waiting for your answer" "$(push_state)" '{}'
+    return 0
+  fi
+  backup "${1:-}"
+}
+
+cmd_apply() { need_repo; take_lock; [ -f "$STATE_DIR/incoming.json" ] || { echo "nothing waiting"; return 0; }; do_apply; }
+
+# Not now: keep this machine's version, remember the decision for that revision, and carry on backing up.
+cmd_skip() {
+  need_repo; take_lock
+  [ -f "$STATE_DIR/incoming.json" ] && jq -r .rev "$STATE_DIR/incoming.json" > "$STATE_DIR/declined"
+  rm -f "$STATE_DIR/incoming.json"; backup "$@"
+}
 
 push_state() {
   cd "$REPO" || return
@@ -477,7 +611,8 @@ cmd_status() {
       --arg interval "$interval" --arg intervals "$INTERVALS" --argjson running "$running" --arg remote "$remote" \
       --argjson undoc "$undoc" --argjson missing "$missing" --arg rrev "$rrev" --argjson commits "$commits" \
       --arg repo "$REPO" --arg machine "$MACHINE" \
-      '{repo:$repo,machine:$machine,status:$st,message:$msg,time:$time,lastEpoch:$lastEpoch,pending:$pending,unpushed:$ahead,timer:$timer,
+      --argjson incoming "$(cat "$STATE_DIR/incoming.json" 2>/dev/null || echo null)" \
+      '{incoming:$incoming,repo:$repo,machine:$machine,status:$st,message:$msg,time:$time,lastEpoch:$lastEpoch,pending:$pending,unpushed:$ahead,timer:$timer,
         nextEpoch:$next,interval:$interval,intervals:($intervals|split(" ")),running:$running,remote:$remote,
         undocumented:$undoc,missingPackages:$missing,restoreRev:$rrev,commits:$commits}'
   else
@@ -769,6 +904,8 @@ cmd_uninstall() {
 case "${1:-status}" in
   run) shift; cmd_run "$@" ;;
   pull) shift; cmd_pull "$@" ;;
+  apply) cmd_apply ;;
+  skip) shift; cmd_skip "$@" ;;
   status) shift; cmd_status "${1:-}" ;;
   log) shift; cmd_log "${1:-5}" "${2:-}" ;;
   machines) cmd_machines ;;
@@ -780,5 +917,5 @@ case "${1:-status}" in
   restore-github) shift; cmd_restore_github "$@" ;;
   install) cmd_install ;;
   uninstall) cmd_uninstall ;;
-  *) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  *) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

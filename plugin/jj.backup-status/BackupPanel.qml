@@ -22,13 +22,14 @@ Panel {
                         undocumented: [], missingPackages: [], commits: [] })
   property bool backingUp: false
   property bool restoring: false
+  property bool answering: false
   property var confirmCommit: null
   property int confirmChoice: 1
   property bool loaded: false
   property int cursorIndex: -1
   property real now: Date.now() / 1000
 
-  readonly property bool running: backingUp || restoring || info.running === true
+  readonly property bool running: backingUp || restoring || answering || info.running === true
   readonly property bool unconfigured: info.status === "unconfigured"
   readonly property bool failed: info.status === "error"
   readonly property bool timerOff: loaded && !unconfigured && info.timer !== "active"
@@ -36,7 +37,10 @@ Panel {
   readonly property var commits: info.commits || []
   readonly property bool problem: failed || timerOff || unconfigured
   readonly property var missingPackages: info.missingPackages || []
-  readonly property bool hasAlert: !unconfigured && (problem || undocumented.length > 0 || missingPackages.length > 0)
+  // Configuration another machine saved that is waiting for the user's answer (omarchy-sync apply | skip).
+  readonly property var incoming: info.incoming || null
+  readonly property bool hasIncoming: incoming !== null
+  readonly property bool hasAlert: !unconfigured && (problem || hasIncoming || undocumented.length > 0 || missingPackages.length > 0)
   readonly property var scheduleOptions: {
     var labels = { "15min": "15m", "30min": "30m", "1h": "1h", "6h": "6h", "12h": "12h", "24h": "24h", "off": strings.t("schedule.off") }
     var list = info.intervals && info.intervals.length ? info.intervals : ["15min", "30min", "1h", "6h", "12h", "24h", "off"]
@@ -156,6 +160,12 @@ Panel {
     root.close()
   }
 
+  function answerIncoming(choice) {
+    answering = true
+    answerProc.command = ["omarchy-sync", choice]
+    answerProc.running = true
+  }
+
   function installMissing() {
     Quickshell.execDetached(["omarchy-launch-floating-terminal-with-presentation", "omarchy-sync restore-packages"])
   }
@@ -229,6 +239,14 @@ Panel {
       root.refresh()
       Quickshell.execDetached(["notify-send", "-a", "Backup", strings.t("title"),
                                exitCode === 0 ? strings.t("notify.restored") : strings.t("notify.restoreFailed")])
+    }
+  }
+
+  Process {
+    id: answerProc
+    onExited: function(exitCode) {
+      root.answering = false
+      root.refresh()
     }
   }
 
@@ -478,6 +496,48 @@ Panel {
                 Layout.fillWidth: true
                 spacing: Style.space(3)
 
+                Text {
+                  visible: root.hasIncoming
+                  width: parent.width
+                  textFormat: Text.PlainText
+                  text: root.hasIncoming ? strings.t("incoming.title").arg(String(root.incoming.from)) : ""
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                  font.bold: true
+                  wrapMode: Text.WordWrap
+                }
+                Text {
+                  visible: root.hasIncoming
+                  width: parent.width
+                  textFormat: Text.PlainText
+                  text: root.hasIncoming
+                        ? strings.tn("incoming.files", (root.incoming.files || []).length).arg((root.incoming.files || []).length)
+                          + ((root.incoming.extras || []).length > 0 ? "\n" + (root.incoming.extras || []).join("\n") : "")
+                        : ""
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  wrapMode: Text.WordWrap
+                }
+                RowLayout {
+                  visible: root.hasIncoming
+                  width: parent.width
+                  spacing: Style.space(8)
+
+                  LinkChip {
+                    Layout.preferredWidth: chipRowWidth + Style.space(20)
+                    glyph: root.glyphBox
+                    label: strings.t("incoming.apply")
+                    onActivated: root.answerIncoming("apply")
+                  }
+                  LinkChip {
+                    Layout.preferredWidth: chipRowWidth + Style.space(20)
+                    glyph: root.glyphFile
+                    label: strings.t("incoming.skip")
+                    onActivated: root.answerIncoming("skip")
+                  }
+                }
                 Text {
                   visible: root.failed
                   width: parent.width

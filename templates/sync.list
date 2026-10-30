@@ -45,3 +45,19 @@
 .local/bin/display-profile
 .claude/CLAUDE.md
 .claude/projects/-home-jj/memory
+
+# AI agents: instructions, hooks, skills, rules, MCP servers. Sign-ins, sessions, history and caches stay out.
+.claude/hooks
+.claude/skills
+.claude/agents
+.claude/commands
+.claude/keybindings.json
+.codex/AGENTS.md
+.codex/skills
+.codex/rules
+.codex/herdr-agent-state.sh
+.cursor/herdr-agent-state.sh
+.cursor/agents
+.grok/hooks
+.pi/agent/mcp.json
+.agents/skills
