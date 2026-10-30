@@ -48,6 +48,7 @@ EXCLUDES=(
   --exclude='/.codex/skills/.system' --exclude='/.config/terminal/completions'
   --exclude='herdr-agent-state.*' --exclude='herdr-omp-agent-state.*'
   --exclude='history.jsonl' --exclude='*cache*' --exclude='*.bak*' --exclude='*.pre-dotfiles'
+  --exclude='/.config/hypr/monitors.lua'
 )
 MAXSIZE=2M
 
@@ -439,6 +440,8 @@ cmd_restore() {
   git -C "$REPO" archive "$sha" home | tar -x -C "$tmp"
   # Where the backup repo lives is this machine's business, not the backup's.
   rm -f "$tmp/home/.config/omarchy-sync/config"
+  # So is its screen: another machine's resolution breaks where clicks land.
+  rm -f "$tmp/home/.config/hypr/monitors.lua"
 
   if [ -n "$dry" ]; then
     rsync -ac -n --itemize-changes "$tmp/home/" "$HOME/" | grep -E '^>f' | awk '{print $2}'
