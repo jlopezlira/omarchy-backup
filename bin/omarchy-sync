@@ -255,6 +255,11 @@ backup() {
   fi
   extra=$(jq -n --arg r "$(state_field restoreRev)" 'if $r == "" then {} else {restoreRev:$r} end')
   if git diff --cached --quiet; then
+    # Nothing new, but an earlier push may have failed: retry it rather than report "No changes"
+    # while those backups sit on this machine only.
+    if [ "$(push_state)" = local ] && git remote | grep -q . && [ -z "${OMARCHY_SYNC_NOPUSH:-}" ]; then
+      push_and_record "No changes; earlier backups pushed" "$extra"; echo "no changes"; return
+    fi
     write_state ok "No changes" "$(push_state)" "$extra"; echo "no changes"; return 0
   fi
   n=$(git diff --cached --name-only | wc -l)
@@ -264,12 +269,22 @@ backup() {
     write_state ok "$n files backed up (local only, no remote)" local "$extra"
   elif [ -n "${OMARCHY_SYNC_NOPUSH:-}" ]; then
     write_state ok "$n files backed up (not pushed)" local "$extra"
-  elif push_backup; then
-    write_state ok "$n files backed up" pushed "$extra"
   else
-    write_state ok "$n files backed up, push failed: $(head -c 120 "$STATE_DIR/push.err" | tr '\n' ' ')" local "$extra"
+    push_and_record "$n files backed up" "$extra"
   fi
   echo "backed up $n files"
+}
+
+# A failed push is an error, not "ok": the bar turns red and the other machines can't see
+# these backups until it is fixed. $1 = message on success, $2 = extra state json.
+push_and_record() {
+  if push_backup; then
+    write_state ok "$1" pushed "$2"
+  else
+    write_state error "Push failed: $(head -c 120 "$STATE_DIR/push.err" | tr '\n' ' ')" local "$2"
+    notify-send -u critical "Backup not pushed" "Backups stay on this machine only. Run: omarchy-sync status" 2>/dev/null
+    return 1
+  fi
 }
 
 # Several machines push to one branch. When another one pushed first, merge its history in:
