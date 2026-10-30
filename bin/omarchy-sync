@@ -116,10 +116,17 @@ capture() { # file cmd...
 # Which Claude Code marketplaces and plugins are installed, by name, so another machine can
 # install the same ones (the plugin files themselves live in a per-machine cache).
 claude_plugins_json() {
-  local c="$HOME/.claude/plugins"
+  local c="$HOME/.claude/plugins" json name path url
   [ -f "$c/installed_plugins.json" ] && [ -f "$c/known_marketplaces.json" ] || return 1
-  jq -S -n --slurpfile i "$c/installed_plugins.json" --slurpfile m "$c/known_marketplaces.json" \
-    '{marketplaces: ($m[0] | with_entries(.value = .value.source)), plugins: ($i[0].plugins | keys)}'
+  json=$(jq -S -n --slurpfile i "$c/installed_plugins.json" --slurpfile m "$c/known_marketplaces.json" \
+    '{marketplaces: ($m[0] | with_entries(.value = .value.source)), plugins: ($i[0].plugins | keys)}') || return 1
+  # A marketplace that is a local folder with a GitHub remote is recorded by that repo, so other machines can clone it.
+  while IFS=$'\t' read -r name path; do
+    url=$(git -C "$path" remote get-url origin 2>/dev/null | sed -E 's#^(git@github.com:|https://github.com/)##; s#\.git$##')
+    [[ $url == */* && $url != *:* ]] || continue
+    json=$(jq --arg n "$name" --arg r "$url" '.marketplaces[$n] = {source: "github", repo: $r}' <<<"$json")
+  done < <(jq -r '.marketplaces | to_entries[] | select(.value.source == "directory") | [.key, .value.path] | @tsv' <<<"$json")
+  printf '%s\n' "$json"
 }
 
 snapshot_software() {
