@@ -247,12 +247,31 @@ backup() {
     write_state ok "$n files backed up (local only, no remote)" local "$extra"
   elif [ -n "${OMARCHY_SYNC_NOPUSH:-}" ]; then
     write_state ok "$n files backed up (not pushed)" local "$extra"
-  elif git push -q 2>"$STATE_DIR/push.err"; then
+  elif push_backup; then
     write_state ok "$n files backed up" pushed "$extra"
   else
     write_state ok "$n files backed up, push failed: $(head -c 120 "$STATE_DIR/push.err" | tr '\n' ' ')" local "$extra"
   fi
   echo "backed up $n files"
+}
+
+# Several machines push to one branch. When another one pushed first, merge its history in:
+# this machine's files (home/, pkgs/, INVENTORY.md) win, shared files (sync.list, apps/,
+# AGENTS.md) keep both sides' edits, and every machine's backups stay restorable.
+push_backup() {
+  local err="$STATE_DIR/push.err" pre up
+  git push -q 2>"$err" && return 0
+  up=$(git rev-parse --abbrev-ref '@{u}' 2>/dev/null) || return 1
+  timeout 60 git fetch -q 2>>"$err" || return 1
+  git merge-base --is-ancestor "$up" HEAD && return 1   # not behind: the push failed for another reason
+  pre=$(git rev-parse HEAD)
+  git merge -q --no-commit --no-ff -X ours "$up" >/dev/null 2>&1 || true
+  git rm -rq --cached --ignore-unmatch home pkgs INVENTORY.md
+  git checkout "$pre" -- home pkgs INVENTORY.md
+  git clean -fdq home pkgs
+  git add -A
+  git commit -q -m "merge: backups from other machines" --trailer "Machine: $MACHINE" 2>>"$err" || { git merge --abort 2>/dev/null; return 1; }
+  git push -q 2>>"$err"
 }
 
 take_lock() { exec 9>"$LOCK"; flock -n 9 || { echo "a backup is already running" >&2; exit 3; }; }
