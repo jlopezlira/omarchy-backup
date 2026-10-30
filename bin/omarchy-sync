@@ -4,7 +4,7 @@
 # The backup repo path is REPO= in ~/.config/omarchy-sync/config (default ~/omarchy-sync).
 #
 #   omarchy-sync init [path] [--github NAME | --remote URL | --local]   choose where backups go
-#   omarchy-sync run                      sync now: bring in other machines' changes, back up, push
+#   omarchy-sync run                      update this tool, then sync now: bring in other machines' changes, back up, push
 #   omarchy-sync apply | skip             answer 'new configuration from another machine': apply it, or keep mine
 #   omarchy-sync pull [--dry-run] [--from REV]  only bring in other machines' changes (3-way, nothing is overwritten unseen)
 #   omarchy-sync status [--json]          state, schedule and the last 5 backups
@@ -416,16 +416,28 @@ PLUGIN_DIR="$HOME/.config/omarchy/plugins/jj.backup-status"
 self_update() { # args to re-run with
   [ -z "${OMARCHY_SYNC_UPDATED:-}" ] || return 0
   git -C "$TOOL" rev-parse --git-dir >/dev/null 2>&1 || return 0
-  if git -C "$TOOL" diff --quiet HEAD 2>/dev/null; then
-    local before; before=$(git -C "$TOOL" rev-parse HEAD)
-    if timeout 30 git -C "$TOOL" pull -q --ff-only 2>/dev/null && [ "$(git -C "$TOOL" rev-parse HEAD)" != "$before" ]; then
+  local before err="$STATE_DIR/self-update.err"
+  before=$(git -C "$TOOL" rev-parse HEAD)
+  # --autostash keeps local edits to the tool: they are set aside, the update is applied, and they come back.
+  if timeout 60 git -C "$TOOL" pull -q --ff-only --autostash 2>"$err"; then
+    rm -f "$err" "$STATE_DIR/self-update.notified"
+    if [ "$(git -C "$TOOL" rev-parse HEAD)" != "$before" ]; then
+      echo "omarchy-sync updated: $(git -C "$TOOL" rev-parse --short "$before") -> $(git -C "$TOOL" rev-parse --short HEAD)"
       cmd_install >/dev/null
       OMARCHY_SYNC_UPDATED=1 exec "$TOOL/bin/omarchy-sync" "$@"
     fi
+  else
+    # Keep working with the current version, but say so once: a machine on an old tool syncs wrong.
+    echo "omarchy-sync could not update itself: $(head -c 200 "$err" | tr '\n' ' ')" >&2
+    if [ ! -f "$STATE_DIR/self-update.notified" ]; then
+      touch "$STATE_DIR/self-update.notified"
+      notify-send -u critical -a "Sync" "omarchy-sync could not update itself" "$(head -c 200 "$err")" 2>/dev/null
+    fi
   fi
-  # Pulled by hand but never installed: the bar would keep running the old plugin.
+  # Pulled by hand but never installed: the bar would keep running the old plugin, the timer the old schedule.
   diff -rq "$TOOL/plugin/jj.backup-status" "$PLUGIN_DIR" >/dev/null 2>&1 \
     || rsync -a --delete "$TOOL/plugin/jj.backup-status/" "$PLUGIN_DIR/"
+  cmp -s "$TOOL/systemd/omarchy-sync.timer" "$UNIT_DIR/omarchy-sync.timer" || cmd_install >/dev/null
 }
 
 # Bring in what OTHER machines changed, file by file (3-way against the last state both sides
@@ -545,7 +557,7 @@ cmd_run() {
   backup "${1:-}"
 }
 
-cmd_apply() { need_repo; take_lock; [ -f "$STATE_DIR/incoming.json" ] || { echo "nothing waiting"; return 0; }; do_apply; }
+cmd_apply() { need_repo; self_update apply; take_lock; [ -f "$STATE_DIR/incoming.json" ] || { echo "nothing waiting"; return 0; }; do_apply; }
 
 # Not now: keep this machine's version, remember the decision for that revision, and carry on backing up.
 cmd_skip() {

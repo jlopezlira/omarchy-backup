@@ -61,3 +61,12 @@
 .grok/hooks
 .pi/agent/mcp.json
 .agents/skills
+
+# Desktop and shell bits that were missing (added 2026-10-30)
+.config/fontconfig
+.config/kitty
+.config/hyprland-preview-share-picker
+.local/share/oh-my-zsh/custom
+.local/share/icons
+.gemini/config
+.hermes
