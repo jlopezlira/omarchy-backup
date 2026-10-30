@@ -3,7 +3,9 @@ Description=Scheduled Omarchy backup
 
 [Timer]
 OnBootSec=5min
-OnUnitActiveSec=1h
+# Wall-clock schedule (omarchy-sync interval rewrites it). Monotonic OnUnitActiveSec left the timer
+# "elapsed" with nothing scheduled whenever it was restarted before the service had run that boot.
+OnCalendar=hourly
 Persistent=true
 
 [Install]

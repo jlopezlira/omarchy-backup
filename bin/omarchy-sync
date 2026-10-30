@@ -664,7 +664,9 @@ cmd_interval() {
     systemctl --user disable --now omarchy-sync.timer >/dev/null 2>&1
     echo "automatic backups off"; return
   fi
-  printf '[Timer]\nOnUnitActiveSec=\nOnUnitActiveSec=%s\n' "$v" > "$UNIT_DIR/omarchy-sync.timer.d/interval.conf"
+  local cal
+  case "$v" in 15min) cal="*:0/15" ;; 30min) cal="*:0/30" ;; 1h) cal="hourly" ;; 6h) cal="00/6:00" ;; 12h) cal="00/12:00" ;; 24h) cal="daily" ;; esac
+  printf '[Timer]\nOnUnitActiveSec=\nOnCalendar=\nOnCalendar=%s\n' "$cal" > "$UNIT_DIR/omarchy-sync.timer.d/interval.conf"
   systemctl --user daemon-reload
   systemctl --user enable omarchy-sync.timer >/dev/null 2>&1
   systemctl --user restart omarchy-sync.timer
