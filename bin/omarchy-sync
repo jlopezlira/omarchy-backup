@@ -284,25 +284,49 @@ herdr_behind() { # rev
            <(herdr integration status 2>/dev/null | sort) | cut -d: -f1
 }
 
-# Packages the other machine has (union, nothing is removed). Needs root: sudo in a terminal,
-# pkexec from the bar.
+# Packages the other machine has (union, nothing is removed). Needs root: sudo asks for the
+# password right here in a terminal; from the bar or the timer, a floating terminal opens to ask it
+# (Omarchy runs no polkit agent, so pkexec would just fail there).
 apply_packages() { # rev
-  local rev="$1" su="" a pkgs
+  local rev="$1" native aur cmd pkgs
   pkgs=$(missing_packages "$rev")
   [ -n "$pkgs" ] || return 0
-  if [ -t 0 ]; then su=sudo; elif command -v pkexec >/dev/null; then su=pkexec; fi
-  [ -n "$su" ] || { echo "packages to install (needs root): $(tr '\n' ' ' <<<"$pkgs")" >&2; return 0; }
   echo "packages: $(tr '\n' ' ' <<<"$pkgs")"
-  a=$(comm -12 <(sort <<<"$pkgs") <(git -C "$REPO" show "$rev:pkgs/native.txt" 2>/dev/null | sort -u))
-  [ -z "$a" ] || $su pacman -S --needed --noconfirm $a || echo "  some packages failed: $a" >&2
-  a=$(comm -12 <(sort <<<"$pkgs") <(git -C "$REPO" show "$rev:pkgs/foreign.txt" 2>/dev/null | sort -u))
-  [ -z "$a" ] || ! command -v yay >/dev/null || yay -S --needed --noconfirm --sudo "$su" $a || echo "  some AUR packages failed: $a" >&2
+  native=$(comm -12 <(sort <<<"$pkgs") <(git -C "$REPO" show "$rev:pkgs/native.txt" 2>/dev/null | sort -u) | tr '\n' ' ')
+  aur=$(comm -12 <(sort <<<"$pkgs") <(git -C "$REPO" show "$rev:pkgs/foreign.txt" 2>/dev/null | sort -u) | tr '\n' ' ')
+  cmd="true"
+  [ -z "${native// }" ] || cmd="$cmd && sudo pacman -S --needed --noconfirm $native"
+  [ -z "${aur// }" ] || ! command -v yay >/dev/null || cmd="$cmd && yay -S --needed --noconfirm $aur"
+  if [ -t 0 ]; then
+    bash -c "$cmd" || echo "  some packages failed: $native$aur" >&2
+  elif command -v omarchy-launch-floating-terminal-with-presentation >/dev/null; then
+    omarchy-launch-floating-terminal-with-presentation "echo 'Installing the packages the other machine has:'; echo '  $native$aur'; $cmd" >/dev/null 2>&1 </dev/null &
+    disown 2>/dev/null
+  else
+    echo "  needs a terminal for the password: sudo pacman -S --needed $native$aur" >&2
+  fi
+}
+
+# mise tools the backup has newer: name<TAB>version (pkgs/mise.txt: name version source requested)
+mise_behind() { # rev
+  command -v mise >/dev/null || return 0
+  local name ver have
+  while read -r name ver _; do
+    [ -n "$name" ] || continue
+    have=$(mise ls --current 2>/dev/null | awk -v n="$name" '$1 == n {print $2; exit}')
+    [ -z "$have" ] || [ "$(printf '%s\n%s\n' "$have" "$ver" | sort -V | tail -1)" != "$have" ] && printf '%s\t%s\n' "$name" "$ver"
+  done < <(git -C "$REPO" show "$1:pkgs/mise.txt" 2>/dev/null)
 }
 
 # Tools the other machine has: pnpm globals (Codex, Pi), mise tools, herdr integrations and Pi's packages.
 apply_software() { # rev
   local rev="$1" name ver a
   command -v mise >/dev/null && { mise install -q >/dev/null 2>&1 || echo "  mise install failed" >&2; }
+  # Same exact version on both machines: `mise use -g` pins it in mise's config.toml, which is synced.
+  while IFS=$'\t' read -r name ver; do
+    [ -n "$name" ] || continue
+    echo "mise: $name@$ver"; mise use -g -q "$name@$ver" >/dev/null 2>&1 || echo "  could not install $name@$ver" >&2
+  done < <(mise_behind "$rev")
   while IFS=$'\t' read -r name ver; do
     [ -n "$name" ] || continue
     echo "pnpm: $name@$ver"; pnpm add -g "$name@$ver" >/dev/null 2>&1 || echo "  could not install $name@$ver" >&2
@@ -381,6 +405,9 @@ extras_diff() { # rev base
   fi
   if changed_upstream "$rev" "$base" pkgs/herdr-integrations.txt; then
     n=$(herdr_behind "$rev" | wc -l); [ "$n" -eq 0 ] || parts="${parts:+$parts, }$n herdr integrations"
+  fi
+  if changed_upstream "$rev" "$base" pkgs/mise.txt; then
+    n=$(mise_behind "$rev" | wc -l); [ "$n" -eq 0 ] || parts="${parts:+$parts, }$n mise tools"
   fi
   [ -z "$parts" ] || printf 'software\t%s to update\n' "$parts"
 }
