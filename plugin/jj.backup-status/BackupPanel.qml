@@ -40,6 +40,15 @@ Panel {
   // Configuration another machine saved that is waiting for the user's answer (omarchy-sync apply | skip).
   readonly property var incoming: info.incoming || null
   readonly property bool hasIncoming: incoming !== null
+  // One row per change the user can apply or decline on its own: files first, then theme/packages/...
+  readonly property var incomingItems: {
+    if (!hasIncoming) return []
+    var both = incoming.both || [], out = []
+    ;(incoming.files || []).forEach(function(f) { out.push({ id: f, label: f, both: both.indexOf(f) >= 0 }) })
+    ;(incoming.extras || []).forEach(function(e) { out.push({ id: e.id, label: e.label, both: false }) })
+    return out
+  }
+  readonly property int incomingShown: 14
   readonly property bool hasAlert: !unconfigured && (problem || hasIncoming || undocumented.length > 0 || missingPackages.length > 0)
   readonly property var scheduleOptions: {
     var labels = { "15min": "15m", "30min": "30m", "1h": "1h", "6h": "6h", "12h": "12h", "24h": "24h", "off": strings.t("schedule.off") }
@@ -160,9 +169,9 @@ Panel {
     root.close()
   }
 
-  function answerIncoming(choice) {
+  function answerIncoming(choice, item) {
     answering = true
-    answerProc.command = ["omarchy-sync", choice]
+    answerProc.command = item ? ["omarchy-sync", choice, item] : ["omarchy-sync", choice]
     answerProc.running = true
   }
 
@@ -513,8 +522,42 @@ Panel {
                   textFormat: Text.PlainText
                   text: root.hasIncoming
                         ? strings.tn("incoming.files", (root.incoming.files || []).length).arg((root.incoming.files || []).length)
-                          + ((root.incoming.extras || []).length > 0 ? "\n" + (root.incoming.extras || []).join("\n") : "")
                         : ""
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  wrapMode: Text.WordWrap
+                }
+                Repeater {
+                  model: root.hasIncoming ? root.incomingItems.slice(0, root.incomingShown) : []
+                  delegate: RowLayout {
+                    width: alertColumn.width
+                    spacing: Style.space(8)
+
+                    Text {
+                      Layout.fillWidth: true
+                      textFormat: Text.PlainText
+                      elide: Text.ElideMiddle
+                      text: modelData.label + (modelData.both ? "  · " + strings.t("incoming.both") : "")
+                      color: modelData.both ? root.foreground : root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
+                    AnswerLink {
+                      text: strings.t("incoming.yes")
+                      onActivated: root.answerIncoming("apply", modelData.id)
+                    }
+                    AnswerLink {
+                      text: strings.t("incoming.no")
+                      onActivated: root.answerIncoming("skip", modelData.id)
+                    }
+                  }
+                }
+                Text {
+                  visible: root.hasIncoming && root.incomingItems.length > root.incomingShown
+                  width: parent.width
+                  textFormat: Text.PlainText
+                  text: root.hasIncoming ? strings.t("incoming.more").arg(root.incomingItems.length - root.incomingShown) : ""
                   color: root.dim
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
@@ -841,6 +884,28 @@ Panel {
         font.pixelSize: Style.font.caption
         elide: Text.ElideRight
       }
+    }
+  }
+
+  // A small text action next to one incoming change (apply or skip just that one).
+  component AnswerLink: Text {
+    id: link
+    signal activated()
+    textFormat: Text.PlainText
+    color: linkMouse.containsMouse ? root.foreground : root.dim
+    font.family: root.fontFamily
+    font.pixelSize: Style.font.caption
+    font.underline: linkMouse.containsMouse
+    opacity: root.answering ? 0.4 : 1
+
+    MouseArea {
+      id: linkMouse
+      anchors.fill: parent
+      anchors.margins: -Style.space(4)
+      hoverEnabled: true
+      enabled: !root.answering
+      cursorShape: Qt.PointingHandCursor
+      onClicked: link.activated()
     }
   }
 

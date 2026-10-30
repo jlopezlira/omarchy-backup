@@ -76,6 +76,10 @@
     "one": "%1 file changed",
     "other": "%1 files changed"
   },
-  "incoming.apply": "Apply",
-  "incoming.skip": "Not now"
+  "incoming.both": "changed here too",
+  "incoming.yes": "Apply",
+  "incoming.no": "Skip",
+  "incoming.more": "… and %1 more: omarchy-sync apply | skip <file>",
+  "incoming.apply": "Apply all",
+  "incoming.skip": "Skip all"
 }
