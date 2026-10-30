@@ -6,7 +6,7 @@
 #   omarchy-sync init [path] [--github NAME | --remote URL | --local]   choose where backups go
 #   omarchy-sync run                      update this tool, then sync now: bring in other machines' changes, back up, push
 #   omarchy-sync apply | skip             answer 'new configuration from another machine': apply it, or keep mine
-#   omarchy-sync pull [--dry-run] [--from REV]  only bring in other machines' changes (3-way, nothing is overwritten unseen)
+#   omarchy-sync pull [--dry-run] [--from REV [--base REV]]  only bring in other machines' changes (3-way; the other copy wins a conflict)
 #   omarchy-sync status [--json]          state, schedule and the last 5 backups
 #   omarchy-sync log [N] [machine]        last N backups (of every machine, or only one)
 #   omarchy-sync machines                 machines in this backup repo and their latest backup
@@ -99,6 +99,31 @@ copy_files() { # $1 = "" or "-n" (dry run)
       ( cd "$HOME" && rsync -aRc $dry --max-size=$MAXSIZE "${EXCLUDES[@]}" --itemize-changes "./$entry" "$REPO/home/" )
     fi
   done < "$REPO/sync.list"
+  local list; list=$(mktemp); referenced_files > "$list"
+  [ -s "$list" ] && ( cd "$HOME" && rsync -aRc $dry --files-from="$list" --max-size=$MAXSIZE "${EXCLUDES[@]}" --itemize-changes . "$REPO/home/" )
+  rm -f "$list"
+}
+
+# Files that synced configs point at (~/.claude/statusline.sh in settings.json, a hook script...)
+# travel too, even when sync.list does not name them: a setting is useless without its script.
+# Only hidden config paths under $HOME; state, caches and plugin caches stay out.
+referenced_files() {
+  local user rel entry covered
+  user=$(id -un)
+  grep -rhoIE "(~|\\\$HOME|\\\$\\{HOME\\}|/home/$user)/\.[A-Za-z0-9._/-]+" "$REPO/home" 2>/dev/null \
+    | sed -E "s#^(~|\\\$HOME|\\\$\\{HOME\\}|/home/$user)/##; s#[.]+\$##" | sort -u \
+    | while IFS= read -r rel; do
+        # Text files only: a referenced program (a symlink in ~/.local/bin, an AppImage, a mise
+        # install) is documented in apps/, not copied.
+        [ -f "$HOME/$rel" ] && [ ! -L "$HOME/$rel" ] && grep -qI '' "$HOME/$rel" || continue
+        case "$rel" in .cache/*|.local/state/*|.local/share/omarchy/*|.local/share/mise/*|.local/share/pnpm/*|*/node_modules/*|*/cache/*|.claude/projects/*|.claude/plugins/*|.git/*) continue ;; esac
+        covered=""
+        while IFS= read -r entry; do
+          [[ -z "$entry" || "$entry" == \#* ]] && continue
+          [[ "$rel" == "$entry" || "$rel" == "$entry"/* ]] && { covered=1; break; }
+        done < "$REPO/sync.list"
+        [ -n "$covered" ] || printf '%s\n' "$rel"
+      done
 }
 
 # Write a command's output to a file, but keep the previous file when the command is
@@ -129,6 +154,45 @@ claude_plugins_json() {
   printf '%s\n' "$json"
 }
 
+# ~/.claude.json mixes the sign-in with preferences. Only the preferences travel: trusted folders
+# (with their allowed tools and MCP servers), user MCP servers, onboarding and "already seen"
+# notices, so another machine stops asking the same questions. Account, IDs, caches and counters
+# stay here; env/header values and anything named like a token are recorded as REDACTED.
+claude_state_json() {
+  [ -f "$HOME/.claude.json" ] || return 1
+  jq -S --arg home "$HOME" '
+    with_entries(select(.key | test("^(hasCompletedOnboarding|lastOnboardingVersion|hasSeen.*|hasReset.*|hasAcknowledged.*|bypassPermissionsModeAccepted|autoModeEnvSetup|theme|editorMode|autoUpdates|verbose|preferredNotifChannel|autoCompactEnabled|diffTool|autoConnectIde|claudeInChromeDefaultEnabled|mcpServers|projects|officialMarketplaceAutoInstall.*|groveChoiceSeenAt|.*MigrationComplete)$")))
+    | if .projects then .projects |= with_entries(select(.key | startswith($home))
+        | .value |= with_entries(select(.key | test("^(hasTrustDialogAccepted|allowedTools|mcpServers|enabledMcpjsonServers|disabledMcpjsonServers|hasCompletedProjectOnboarding|hasClaudeMdExternalIncludes.*)$")))) else . end
+    | walk(if type == "object" then with_entries(
+        if (.key | test("^(env|headers)$")) and (.value | type) == "object" then .value |= map_values(if type == "string" then "REDACTED" else . end)
+        elif (.key | test("(?i)token|secret|password|api[_-]?key|authorization")) and (.value | type) == "string" then .value = "REDACTED"
+        else . end)
+      elif type == "string" then sub("Bearer [A-Za-z0-9._~+/=-]{20,}"; "Bearer REDACTED") else . end)' "$HOME/.claude.json"
+}
+
+# ~/.claude.json with a backup's preferences merged in (stdout). A REDACTED value never replaces a real one.
+claude_state_merged() { # rev
+  local want
+  want=$(git -C "$REPO" show "$1:pkgs/claude-state.json" 2>/dev/null) || return 1
+  jq --argjson want "$want" '
+    def merge($a; $b): if ($a | type) == "object" and ($b | type) == "object"
+      then reduce ($b | keys_unsorted[]) as $k ($a; .[$k] = merge($a[$k]; $b[$k]))
+      elif $b == "REDACTED" and $a != null then $a else $b end;
+    merge(.; $want)' "$HOME/.claude.json" 2>/dev/null
+}
+
+apply_claude_state() { # rev
+  local tmp; tmp=$(mktemp)
+  [ -f "$HOME/.claude.json" ] || echo '{}' > "$HOME/.claude.json"
+  if claude_state_merged "$1" > "$tmp" && [ -s "$tmp" ] && ! jq -e --slurpfile a "$tmp" '. == $a[0]' "$HOME/.claude.json" >/dev/null; then
+    cp -p "$HOME/.claude.json" "$STATE_DIR/claude.json.before-apply"
+    cat "$tmp" > "$HOME/.claude.json"   # in place: keeps the file's permissions
+    echo "claude: preferences (trusted folders, MCP servers, notices)"
+  fi
+  rm -f "$tmp"
+}
+
 snapshot_software() {
   local p="$REPO/pkgs"; mkdir -p "$p"
   capture "$p/native.txt" sh -c 'pacman -Qqen | sort'
@@ -144,6 +208,7 @@ snapshot_software() {
   capture "$p/gsettings-interface.txt" gsettings list-recursively org.gnome.desktop.interface
   capture "$p/dconf.ini" dconf dump /
   capture "$p/claude-plugins.json" claude_plugins_json
+  capture "$p/claude-state.json" claude_state_json
   # Active theme and background (theme name, then the background's file name)
   capture "$p/omarchy-theme.txt" sh -c 'cat "$HOME/.local/state/omarchy/current/theme.name"; basename "$(readlink "$HOME/.local/state/omarchy/current/background")"'
   # Look toggles live in ~/.local/state, not ~/.config, so record the choices instead of the files
@@ -185,18 +250,78 @@ apply_extras() { # rev base
     now=$(gsettings get "$schema" "$key" 2>/dev/null)
     [ "$now" = "$value" ] || { echo "$key: $now -> $value"; gsettings set "$schema" "$key" "$value" 2>/dev/null; }
   done < <(git -C "$REPO" show "$rev:pkgs/gsettings-interface.txt" 2>/dev/null)
+  apply_claude_state "$rev"
   apply_claude_plugins "$rev"
+  apply_software "$rev"
+}
+
+# Global pnpm tools the backup has newer (or that are missing here): name<TAB>version
+pnpm_behind() { # rev
+  command -v pnpm >/dev/null || return 0
+  local name ver have
+  while IFS=$'\t' read -r name ver; do
+    [ "$name" = pnpm ] && continue
+    have=$(pnpm ls -g --depth=0 2>/dev/null | sed -n "s|^[├└]── $name@||p" | head -1)
+    [ -z "$have" ] || [ "$(printf '%s\n%s\n' "$have" "$ver" | sort -V | tail -1)" != "$have" ] && printf '%s\t%s\n' "$name" "$ver"
+  done < <(git -C "$REPO" show "$1:pkgs/pnpm-global.txt" 2>/dev/null | sed -n 's/^[├└]── \(.*\)@\([^@]*\)$/\1\t\2/p')
+}
+
+# Agents whose herdr integration is installed in the backup but missing or a different version here
+herdr_behind() { # rev
+  command -v herdr >/dev/null || return 0
+  comm -23 <(git -C "$REPO" show "$1:pkgs/herdr-integrations.txt" 2>/dev/null | grep -E ': (current|outdated)' | sort) \
+           <(herdr integration status 2>/dev/null | sort) | cut -d: -f1
+}
+
+# Software the other machine has: packages (union, nothing is removed), pnpm tools, mise tools,
+# herdr integrations and Pi's packages. Packages need root: sudo in a terminal, pkexec from the bar.
+apply_software() { # rev
+  local rev="$1" su="" name ver a pkgs
+  pkgs=$(missing_packages "$rev")
+  if [ -n "$pkgs" ]; then
+    if [ -t 0 ]; then su=sudo; elif command -v pkexec >/dev/null; then su=pkexec; fi
+    if [ -z "$su" ]; then echo "packages to install (needs root): $(tr '\n' ' ' <<<"$pkgs")" >&2
+    else
+      echo "packages: $(tr '\n' ' ' <<<"$pkgs")"
+      a=$(comm -12 <(sort <<<"$pkgs") <(git -C "$REPO" show "$rev:pkgs/native.txt" 2>/dev/null | sort -u))
+      [ -z "$a" ] || $su pacman -S --needed --noconfirm $a || echo "  some packages failed: $a" >&2
+      a=$(comm -12 <(sort <<<"$pkgs") <(git -C "$REPO" show "$rev:pkgs/foreign.txt" 2>/dev/null | sort -u))
+      [ -z "$a" ] || ! command -v yay >/dev/null || yay -S --needed --noconfirm --sudo "$su" $a || echo "  some AUR packages failed: $a" >&2
+    fi
+  fi
+  command -v mise >/dev/null && { mise install -q >/dev/null 2>&1 || echo "  mise install failed" >&2; }
+  while IFS=$'\t' read -r name ver; do
+    [ -n "$name" ] || continue
+    echo "pnpm: $name@$ver"; pnpm add -g "$name@$ver" >/dev/null 2>&1 || echo "  could not install $name@$ver" >&2
+  done < <(pnpm_behind "$rev")
+  for a in $(herdr_behind "$rev"); do
+    echo "herdr integration: $a"; herdr integration install "$a" >/dev/null 2>&1 || echo "  could not install the herdr integration for $a" >&2
+  done
+  if command -v pi >/dev/null && [ -f "$HOME/.pi/agent/settings.json" ]; then
+    for a in $(jq -r '.packages[]? | strings' "$HOME/.pi/agent/settings.json"); do
+      grep -qF "\"${a#npm:}\"" "$HOME/.pi/agent/npm/package.json" 2>/dev/null && [ -d "$HOME/.pi/agent/npm/node_modules/${a#npm:}" ] && continue
+      echo "pi: $a"; pi install "$a" >/dev/null 2>&1 || echo "  could not install Pi package $a" >&2
+    done
+  fi
 }
 
 apply_claude_plugins() { # rev
-  local rev="$1" json name source plugin have
+  local rev="$1" json name source plugin have dir
   command -v claude >/dev/null || return 0
   json=$(git -C "$REPO" show "$rev:pkgs/claude-plugins.json" 2>/dev/null) || return 0
   have=$(claude plugin marketplace list --json 2>/dev/null | jq -r '.[].name' 2>/dev/null)
   while IFS=$'\t' read -r name source; do
     grep -qx "$name" <<<"$have" && continue
     case "$(jq -r .source <<<"$source")" in
-      github)    source=$(jq -r .repo <<<"$source") ;;
+      github)    source=$(jq -r .repo <<<"$source")
+                 # settings.json may name the marketplace by a local folder (extraKnownMarketplaces): clone it there,
+                 # or Claude refuses the GitHub source as "doesn't match its extraKnownMarketplaces entry".
+                 dir=$(jq -r --arg n "$name" '.extraKnownMarketplaces[$n].source | select(.source == "directory") | .path' "$HOME/.claude/settings.json" 2>/dev/null)
+                 if [ -n "$dir" ]; then
+                   [ -d "$dir" ] || { mkdir -p "$(dirname "$dir")"; git clone -q "https://github.com/$source" "$dir"; } \
+                     || { echo "claude marketplace '$name': could not clone $source into $dir" >&2; continue; }
+                   source=$dir
+                 fi ;;
       git|url)   source=$(jq -r '.url // .repo' <<<"$source") ;;
       directory) source=$(jq -r .path <<<"$source")
                  [ -d "$source" ] || { echo "claude marketplace '$name': local folder $source is missing here (publish it to a git remote)" >&2; continue; } ;;
@@ -223,6 +348,16 @@ extras_diff() { # rev base
     n=$(comm -23 <(git -C "$REPO" show "$rev:pkgs/claude-plugins.json" | jq -r '.plugins[]' | sort) \
                  <(claude plugin list --json 2>/dev/null | jq -r '.[].id' | sort) | wc -l)
     [ "$n" -eq 0 ] || echo "$n Claude plugins to install"
+  fi
+  if changed_upstream "$rev" "$base" pkgs/claude-state.json && [ -f "$HOME/.claude.json" ] \
+     && ! claude_state_merged "$rev" | jq -e --slurpfile a "$HOME/.claude.json" '. == $a[0]' >/dev/null 2>&1; then
+    echo "Claude preferences (trusted folders, MCP servers)"
+  fi
+  if changed_upstream "$rev" "$base" pkgs/pnpm-global.txt; then
+    n=$(pnpm_behind "$rev" | wc -l); [ "$n" -eq 0 ] || echo "$n pnpm tools to update"
+  fi
+  if changed_upstream "$rev" "$base" pkgs/herdr-integrations.txt; then
+    n=$(herdr_behind "$rev" | wc -l); [ "$n" -eq 0 ] || echo "$n herdr integrations to update"
   fi
 }
 
@@ -440,6 +575,14 @@ self_update() { # args to re-run with
   cmp -s "$TOOL/systemd/omarchy-sync.timer" "$UNIT_DIR/omarchy-sync.timer" || cmd_install >/dev/null
 }
 
+# The other machine's copy (stdout) with each line holding REDACTED replaced by this machine's line
+# that starts the same way (same key), so a synced config keeps this machine's real secrets.
+fill_redacted() { # other-copy live
+  perl -e 'open my $l, "<", $ARGV[1] or exit 1; my @live = <$l>;
+    open my $o, "<", $ARGV[0] or exit 1;
+    while (<$o>) { if (/^(.*?)REDACTED/) { my $p = $1; my ($m) = grep { index($_, $p) == 0 && !/REDACTED/ } @live; $_ = $m if defined $m } print }' "$1" "$2"
+}
+
 # Bring in what OTHER machines changed, file by file (3-way against the last state both sides
 # share). A file is replaced only when this machine has not touched it since then; otherwise
 # the local file stays and the other version is kept in $STATE_DIR/conflicts. Every file that
@@ -447,7 +590,7 @@ self_update() { # args to re-run with
 # $1 = "" or "-n" (list only). Assumes the lock is held.
 # $1 = "" apply | "-n" list only | "-s" stage: write incoming.json and return 10 when there is something to ask about.
 pull_changes() {
-  local dry="${1:-}" stage="" up base from rel live stamp tmp mode applied=0 kept=0 hypr=0 ff=0 files kept_files extras
+  local dry="${1:-}" stage="" up base from rel live stamp tmp mode note applied=0 kept=0 hypr=0 ff=0 files kept_files extras
   [ "$dry" != "-s" ] || { stage=1; dry="-n"; }
   if [ -n "${PULL_FROM:-}" ]; then   # explicit revision (pull --from): no fetch, no fast-forward
     up=$(git -C "$REPO" rev-parse -q --verify "$PULL_FROM^{commit}") || { echo "unknown revision: $PULL_FROM" >&2; return 1; }
@@ -457,10 +600,11 @@ pull_changes() {
     timeout 60 git -C "$REPO" fetch -q 2>/dev/null || return 0
     up=$(git -C "$REPO" rev-parse -q --verify '@{u}') || return 0
   fi
-  git -C "$REPO" merge-base --is-ancestor "$up" HEAD && return 0
+  [ -n "${PULL_FROM:-}" ] || ! git -C "$REPO" merge-base --is-ancestor "$up" HEAD || return 0
   # Histories that never met (two repos joined for the first time): everything counts as "changed on
   # both sides" unless identical, so the local file is kept.
-  base=$(git -C "$REPO" merge-base HEAD "$up") || base=$(git -C "$REPO" hash-object -t tree /dev/null)
+  if [ -n "${PULL_BASE:-}" ]; then base=$(git -C "$REPO" rev-parse -q --verify "$PULL_BASE^{commit}") || { echo "unknown revision: $PULL_BASE" >&2; return 1; }
+  else base=$(git -C "$REPO" merge-base HEAD "$up") || base=$(git -C "$REPO" hash-object -t tree /dev/null); fi
   from=$(machine_of "$up"); stamp=$(date +%Y%m%d-%H%M%S); tmp=$(mktemp)
   LAST_UP=$up; LAST_BASE=$base; LAST_FROM=$from; files=""; kept_files=""
   [ -n "${PULL_FROM:-}" ] || ! git -C "$REPO" merge-base --is-ancestor HEAD "$up" || ff=1
@@ -473,20 +617,28 @@ pull_changes() {
     [ "$mode" = 120000 ] && continue
     git -C "$REPO" show "$up:home/$rel" > "$tmp" 2>/dev/null || continue
     cmp -s "$tmp" "$live" && continue                       # already identical
-    if [ -e "$live" ] && grep -q REDACTED "$tmp" && ! grep -q REDACTED "$live"; then
-      kept=$((kept + 1)); kept_files+="$rel"$'\n'; [ -n "$stage" ] || echo "keep local   $rel  (the other copy has secrets removed)"
-      continue
+    # Secrets stay per machine: the other copy's REDACTED values are filled from this machine's file.
+    if [ -e "$live" ] && grep -q REDACTED "$tmp"; then
+      fill_redacted "$tmp" "$live" > "$tmp.fill" && cat "$tmp.fill" > "$tmp"; rm -f "$tmp.fill"
+      cmp -s "$tmp" "$live" && continue
     fi
+    note=""
     if [ ! -e "$live" ] && ! git -C "$REPO" cat-file -e "$base:home/$rel" 2>/dev/null; then
       :                                                     # new file from the other machine
     elif [ -e "$live" ] && git -C "$REPO" show "$base:home/$rel" 2>/dev/null | cmp -s - "$live"; then
       :                                                     # untouched here since the shared state
-    else
+    elif [ "$(config_value CONFLICTS)" = mine ]; then       # opt-out: keep this machine's edits
       kept=$((kept + 1)); kept_files+="$rel"$'\n'; [ -n "$stage" ] || echo "keep local   $rel  (changed on both machines)"
       [ -n "$dry" ] || { mkdir -p "$STATE_DIR/conflicts/$stamp/$(dirname "$rel")"; cp "$tmp" "$STATE_DIR/conflicts/$stamp/$rel.from-$from"; }
       continue
+    else
+      # Changed on both machines. They must stay identical, and the user approved this machine's
+      # changes by applying them, so the other copy wins; this one is kept in conflicts/ (and overwritten/).
+      note="  (changed here too; yours saved in conflicts/)"
+      [ -n "$dry" ] || { mkdir -p "$STATE_DIR/conflicts/$stamp/$(dirname "$rel")"; cp -p "$live" "$STATE_DIR/conflicts/$stamp/$rel.mine"; }
     fi
-    applied=$((applied + 1)); files+="$rel"$'\n'; [ -n "$stage" ] || echo "from $from   $rel"
+    applied=$((applied + 1)); files+="$rel"$'\n'; [ -n "$stage" ] || echo "from $from   $rel$note"
+    grep -q REDACTED "$tmp" && { [ -n "$stage" ] || echo "             fill in the secret values marked REDACTED in ~/$rel"; }
     [ -n "$dry" ] && continue
     if [ -e "$live" ]; then mkdir -p "$STATE_DIR/overwritten/$stamp/$(dirname "$rel")"; cp -p "$live" "$STATE_DIR/overwritten/$stamp/$rel"; fi
     mkdir -p "$(dirname "$live")"; cat "$tmp" > "$live"
@@ -528,7 +680,7 @@ cmd_pull() { # [--dry-run] [--from <rev>]
   need_repo
   local dry="" arg
   while [ $# -gt 0 ]; do
-    case "$1" in --dry-run|-n) dry="-n" ;; --from) PULL_FROM="${2:-}"; shift ;; esac
+    case "$1" in --dry-run|-n) dry="-n" ;; --from) PULL_FROM="${2:-}"; shift ;; --base) PULL_BASE="${2:-}"; shift ;; esac
     shift
   done
   take_lock; pull_changes "$dry"
@@ -876,6 +1028,8 @@ cmd_setup() {
     [ -n "$bg" ] && omarchy theme bg set "$HOME/.local/state/omarchy/current/theme/backgrounds/$bg" || true
   fi
   apply_look HEAD
+  apply_claude_state HEAD
+  apply_claude_plugins HEAD
 
   echo "==> Automatic backup"
   cmd_install

@@ -28,7 +28,7 @@ This repo holds only configuration and instructions. It is written by the backup
 
 ## Several machines
 
-All machines share this repo and must end up configured the same (theme, agents, packages, plugins), except work files and per-machine files (`hypr/monitors.lua`, `omarchy/shell.toml`, the sync config). When `omarchy-sync status --json` shows `incoming`, another machine saved new configuration: ask the user, then run `omarchy-sync apply` (or `skip`). Never write secrets into this repo: values shown as `REDACTED` are removed on purpose; the user fills them in per machine.
+All machines share this repo and must end up configured the same (theme, agents, packages, plugins), except work files and per-machine files (`hypr/monitors.lua`, `omarchy/shell.toml`, the sync config). When `omarchy-sync status --json` shows `incoming`, another machine saved new configuration: ask the user, then run `omarchy-sync apply` (or `skip`). On a file changed on both machines the other machine's copy wins (this machine's is kept in `~/.local/state/omarchy-sync/conflicts/`). `apply` also installs the other machine's packages, pnpm tools, herdr integrations, Claude plugins and preferences; it never removes anything. Never write secrets into this repo: values shown as `REDACTED` are removed on purpose, `apply` fills them from this machine's own copy when it has one, and the user fills in the rest.
 
 ## Maintenance
 - `omarchy-sync interval <15min|30min|1h|6h|12h|24h|off>` sets the schedule. Runs commit only when something changed.

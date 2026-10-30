@@ -66,7 +66,9 @@ Before every commit a scan blocks anything that looks like a token or private ke
 
 Every machine backs up into the same repo, and `run` first looks at what the others saved. If another machine changed configuration, **nothing is applied or backed up until you answer**: the bar widget (and a notification) shows what changed with **Apply** / **Not now** buttons, or run `omarchy-sync apply` / `omarchy-sync skip`.
 
-- **Apply** brings in the changed files (3-way per file: a file you also changed stays yours and the other copy is saved in `~/.local/state/omarchy-sync/conflicts/`; every replaced file is first copied to `.../overwritten/`), then sets the theme and GTK appearance, installs Claude Code marketplaces/plugins, and reports missing packages.
+- **Apply** brings in the changed files (3-way per file: a file you also changed takes the other machine's copy, since the machines must stay identical, and yours is saved as `*.mine` in `~/.local/state/omarchy-sync/conflicts/`; every replaced file is first copied to `.../overwritten/`), then sets the theme and GTK appearance, Claude Code's preferences (trusted folders, MCP servers, notices already answered), its marketplaces/plugins, and the software the other machine has: missing packages (sudo, or a pkexec prompt from the bar), newer pnpm tools (Codex, Pi), herdr integrations and Pi's packages. Nothing is ever removed.
+- `CONFLICTS=mine` in `~/.config/omarchy-sync/config` keeps this machine's version of a file changed on both sides instead.
+- Files that a synced config points at (`~/.claude/statusline.sh`, a hook script, `~/.config/alacritty/alacritty.toml`...) travel too, even when `sync.list` does not name them; programs they point at do not.
 - **Not now** keeps this machine's version; the next change from the other machine asks again.
 - Set `AUTO_APPLY=1` in `~/.config/omarchy-sync/config` to apply without asking.
 - Per-machine files never travel: `hypr/monitors.lua`, `omarchy/shell.toml` (text size follows the screen) and `omarchy-sync/config`.
@@ -74,4 +76,4 @@ Every machine backs up into the same repo, and `run` first looks at what the oth
 
 ### No secrets
 
-Credential files (`.credentials.json`, `auth.json`, keys, `.env`, `.npmrc`...) are never copied. Secret values inside synced configs (Bearer tokens, `api_key = "…"`, `sk-`/`ghp_` keys) are replaced by `REDACTED` in the committed copy only, a file whose other copy was redacted never overwrites your real one, and a backup aborts if anything that looks like a secret is still about to be committed.
+Credential files (`.credentials.json`, `auth.json`, keys, `.env`, `.npmrc`...) are never copied. Secret values inside synced configs (Bearer tokens, `api_key = "…"`, `sk-`/`ghp_` keys) are replaced by `REDACTED` in the committed copy only. When such a file is applied on another machine, each `REDACTED` value is filled from that machine's own copy of the same line; a value it never had stays `REDACTED` and `apply` says which file to fill in. A backup aborts if anything that looks like a secret is still about to be committed. `~/.claude.json` is never copied: only its preferences are recorded (`pkgs/claude-state.json`), never the account, IDs or caches.
