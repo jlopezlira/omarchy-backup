@@ -418,7 +418,17 @@ push_state() {
   [ "$(git rev-list --count '@{u}..HEAD' 2>/dev/null || echo 0)" = 0 ] && echo pushed || echo local
 }
 
-pending_count() { copy_files "-n" 2>/dev/null | grep -cE '^(>f|<f|\*deleting)' ; }
+# One rsync for the whole list (spawning one per entry took ~4 s, and the bar widget asks every minute).
+pending_count() {
+  local list entry n
+  list=$(mktemp)
+  while IFS= read -r entry; do
+    [[ -z "$entry" || "$entry" == \#* ]] && continue
+    [ -e "$HOME/$entry" ] && printf '%s\n' "$entry"
+  done < "$REPO/sync.list" > "$list"
+  n=$(cd "$HOME" && rsync -aRcrn --files-from="$list" --max-size=$MAXSIZE "${EXCLUDES[@]}" --itemize-changes . "$REPO/home/" 2>/dev/null | grep -cE '^(>f|<f)')
+  rm -f "$list"; echo "${n:-0}"
+}
 
 missing_packages() { # $1 = rev whose package list to compare with
   local rev="${1:-HEAD}"
