@@ -93,6 +93,8 @@ Panel {
 
   function commitMeta(c) {
     var parts = [ago(c.epoch)]
+    // Which machine made it, so a restore never picks another machine's backup by mistake.
+    if (c.machine && c.machine !== "?") parts.push(c.machine === info.machine ? c.machine + " ✓" : c.machine)
     if (c.files > 0) parts.push(strings.tn("commit.files", c.files).arg(Commons.I18n.formatNumber(c.files)))
     parts.push(String(c.hash || ""))
     return parts.join("  ·  ")

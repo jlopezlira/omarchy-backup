@@ -33,7 +33,7 @@ git clone https://github.com/jlopezlira/omarchy-backup ~/Projects/omarchy-backup
 ~/Projects/omarchy-backup/bin/omarchy-sync restore-github
 ```
 
-It installs `gh` if needed, signs you in to GitHub in the browser, lists your private repos to pick the backup repo, clones it, and shows the last 20 backups so you choose which one to apply. Each backup is named `backup: <date> · <host> · <apps that changed>`, and its commit body lists every file. Then it runs `setup` (packages, files, tools, services, theme, this tool and the bar widget). If the widget is already installed, its first-run panel has a **Restore from GitHub** button that does the same. Finally follow the backup repo's `AGENTS.md`.
+It installs `gh` if needed, signs you in to GitHub in the browser, lists your private repos to pick the backup repo, clones it, and shows the machines it holds and the last 20 backups, each with the machine it came from, so you choose which one to apply. Each backup is named `backup: <date> · <host> · <apps that changed>`, its commit body lists every file, and a `Machine: <host>` trailer records where it was made (older backups fall back to the host in their `INVENTORY.md`). Then it runs `setup` (packages, files, tools, services, theme, this tool and the bar widget). If the widget is already installed, its first-run panel has a **Restore from GitHub** button that does the same. Finally follow the backup repo's `AGENTS.md`.
 
 ## Usage
 
@@ -41,9 +41,11 @@ It installs `gh` if needed, signs you in to GitHub in the browser, lists your pr
 omarchy-sync init [path] [--github NAME | --remote URL | --local]
 omarchy-sync run                       back up now (commits and pushes only when something changed)
 omarchy-sync status [--json]           state, schedule, and the last 5 backups
-omarchy-sync log [N]                   last N backups
+omarchy-sync log [N] [machine]         last N backups, with the machine each came from
+omarchy-sync machines                  machines in the backup repo and their latest backup
 omarchy-sync interval <15min|30min|1h|6h|12h|24h|off>
-omarchy-sync restore <rev> [--dry-run] restore files from a backup (the current setup is snapshotted first)
+omarchy-sync restore <rev|machine> [--dry-run]  restore files from a backup, or a machine's latest one
+                                       (the current setup is snapshotted first; this machine keeps its own REPO=)
 omarchy-sync restore-packages [rev]    install packages a backup had and this machine lacks (sudo)
 omarchy-sync setup [repo]              rebuild a new machine from a backup repo
 omarchy-sync restore-github [owner/name] [path]  sign in, pick a backup, clone it, setup

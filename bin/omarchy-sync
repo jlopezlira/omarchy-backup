@@ -6,9 +6,10 @@
 #   omarchy-sync init [path] [--github NAME | --remote URL | --local]   choose where backups go
 #   omarchy-sync run                      back up now (commit + push)
 #   omarchy-sync status [--json]          state, schedule and the last 5 backups
-#   omarchy-sync log [N]                  last N backups
+#   omarchy-sync log [N] [machine]        last N backups (of every machine, or only one)
+#   omarchy-sync machines                 machines in this backup repo and their latest backup
 #   omarchy-sync interval <15min|30min|1h|6h|12h|24h|off>   change the schedule
-#   omarchy-sync restore <rev> [--dry-run]                  restore files from a backup
+#   omarchy-sync restore <rev|machine> [--dry-run]          restore files from a backup (a machine name = its latest)
 #   omarchy-sync restore-packages [rev]   install packages recorded in a backup (sudo)
 #   omarchy-sync setup [repo]             new machine: packages, files, services, then install
 #   omarchy-sync restore-github [owner/name] [path]  new machine: sign in to GitHub, clone the backup, setup
@@ -50,7 +51,26 @@ EXCLUDES=(
 )
 MAXSIZE=2M
 
+MACHINE=$(hostname)
+
 repo_ready() { git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 && [ -f "$REPO/sync.list" ]; }
+
+# Machine a backup came from: its "Machine:" trailer, or for older backups the host in INVENTORY.md.
+machine_of() { # rev
+  local m
+  m=$(git -C "$REPO" log -1 --format='%(trailers:key=Machine,valueonly,separator=)' "$1" 2>/dev/null)
+  [ -n "$m" ] || m=$(git -C "$REPO" show "$1:INVENTORY.md" 2>/dev/null | sed -n 's/^- Host: \([^ ]*\).*/\1/p' | head -1)
+  echo "${m:-?}"
+}
+
+# Latest backup made on a machine (snapshots and restores count: they are that machine's state).
+latest_of_machine() { # machine
+  local h
+  for h in $(git -C "$REPO" log -300 --format=%h); do
+    [ "$(machine_of "$h")" = "$1" ] && { echo "$h"; return 0; }
+  done
+  return 1
+}
 need_repo() { repo_ready || { echo "no backup location yet: run 'omarchy-sync init'" >&2; exit 4; }; }
 
 get_interval() { local v; v=$(config_value INTERVAL); echo "${v:-1h}"; }
@@ -221,8 +241,8 @@ backup() {
     write_state ok "No changes" "$(push_state)" "$extra"; echo "no changes"; return 0
   fi
   n=$(git diff --cached --name-only | wc -l)
-  [ -n "$subject" ] || subject="backup: $(date '+%Y-%m-%d %H:%M') · $(hostname) · $(changed_areas)"
-  git commit -q -m "$subject" -m "$(git diff --cached --name-status | head -200)" || { write_state error "Commit failed" none "$extra"; return 1; }
+  [ -n "$subject" ] || subject="backup: $(date '+%Y-%m-%d %H:%M') · $MACHINE · $(changed_areas)"
+  git commit -q -m "$subject" -m "$(git diff --cached --name-status | head -200)" --trailer "Machine: $MACHINE" || { write_state error "Commit failed" none "$extra"; return 1; }
   if ! git remote | grep -q .; then
     write_state ok "$n files backed up (local only, no remote)" local "$extra"
   elif [ -n "${OMARCHY_SYNC_NOPUSH:-}" ]; then
@@ -285,27 +305,48 @@ cmd_status() {
   commits=$(git log -5 --format='@@%h%x09%ct%x09%cr%x09%s' --shortstat \
     | awk -F'\t' '/^@@/ {if (h) print h "\t" f; sub(/^@@/,""); h=$0; f=0; next}
                   /files? changed/ {f=$0+0} END {if (h) print h "\t" f}' \
-    | jq -R -s -c 'split("\n")|map(select(length>0)|split("\t")|{hash:.[0],epoch:(.[1]|tonumber),when:.[2],subject:.[3],files:(.[4]|tonumber)})')
+    | while IFS=$'\t' read -r h rest; do printf '%s\t%s\t%s\n' "$h" "$rest" "$(machine_of "$h")"; done \
+    | jq -R -s -c 'split("\n")|map(select(length>0)|split("\t")|{hash:.[0],epoch:(.[1]|tonumber),when:.[2],subject:.[3],files:(.[4]|tonumber),machine:.[5]})')
   if [ "${1:-}" = "--json" ]; then
     jq -n --arg st "$last_status" --arg msg "$last_msg" --arg time "$last_time" --argjson lastEpoch "$last_epoch" \
       --argjson pending "$pending" --argjson ahead "$ahead" --arg timer "$timer" --argjson next "${next:-0}" \
       --arg interval "$interval" --arg intervals "$INTERVALS" --argjson running "$running" --arg remote "$remote" \
       --argjson undoc "$undoc" --argjson missing "$missing" --arg rrev "$rrev" --argjson commits "$commits" \
-      --arg repo "$REPO" \
-      '{repo:$repo,status:$st,message:$msg,time:$time,lastEpoch:$lastEpoch,pending:$pending,unpushed:$ahead,timer:$timer,
+      --arg repo "$REPO" --arg machine "$MACHINE" \
+      '{repo:$repo,machine:$machine,status:$st,message:$msg,time:$time,lastEpoch:$lastEpoch,pending:$pending,unpushed:$ahead,timer:$timer,
         nextEpoch:$next,interval:$interval,intervals:($intervals|split(" ")),running:$running,remote:$remote,
         undocumented:$undoc,missingPackages:$missing,restoreRev:$rrev,commits:$commits}'
   else
+    echo "This machine   : $MACHINE"
     echo "Last backup    : $last_time ($last_status) $last_msg"
     echo "Schedule       : every $interval ($timer)$([ "${next:-0}" -gt 0 ] && date -d "@$next" '+, next at %H:%M')"
     echo "Not backed up  : $pending files    Not pushed: $ahead commits"
     echo "Undocumented   : $(jq -r 'if length == 0 then "none" else join(" ") end' <<<"$undoc")"
     echo "Missing pkgs   : $(jq -r 'if length == 0 then "none" else join(" ") end' <<<"$missing")"
-    echo "Last 5 backups:"; git log -5 --format='  %h  %cr  %s'
+    echo "Last 5 backups:"; cmd_log 5 | sed 's/^/  /'
   fi
 }
 
-cmd_log() { git -C "$REPO" log -"${1:-5}" --format='%h  %cd  %s' --date=format:'%Y-%m-%d %H:%M'; }
+cmd_log() { # [N] [machine]
+  local n="${1:-5}" only="${2:-}" h d s m shown=0
+  while IFS=$'\t' read -r h d s; do
+    m=$(machine_of "$h")
+    [ -z "$only" ] || [ "$m" = "$only" ] || continue
+    printf '%s  %s  %-10s  %s\n' "$h" "$d" "$m" "$s"
+    shown=$((shown + 1)); [ "$shown" -lt "$n" ] || break
+  done < <(git -C "$REPO" log -300 --format='%h%x09%cd%x09%s' --date=format:'%Y-%m-%d %H:%M')
+}
+
+cmd_machines() {
+  need_repo
+  local h d m seen=" "
+  while IFS=$'\t' read -r h d; do
+    m=$(machine_of "$h")
+    [[ "$m" == "?" || "$seen" == *" $m "* ]] && continue
+    seen+="$m "
+    printf '%-10s  latest %s  %s%s\n' "$m" "$h" "$d" "$([ "$m" = "$MACHINE" ] && echo "  (this machine)")"
+  done < <(git -C "$REPO" log -300 --format='%h%x09%cd' --date=format:'%Y-%m-%d %H:%M')
+}
 
 cmd_interval() {
   local v="${1:-}"
@@ -326,17 +367,24 @@ cmd_interval() {
 
 cmd_restore() {
   need_repo
-  local rev="" dry="" arg sha short tmp changed n
+  local rev="" dry="" arg sha short tmp changed n from
   for arg in "$@"; do
     case "$arg" in --dry-run|-n) dry="-n" ;; *) rev="$arg" ;; esac
   done
-  [ -n "$rev" ] || { echo "usage: omarchy-sync restore <rev> [--dry-run]" >&2; exit 1; }
-  sha=$(git -C "$REPO" rev-parse --verify -q "$rev^{commit}") || { echo "unknown backup: $rev" >&2; exit 1; }
+  [ -n "$rev" ] || { echo "usage: omarchy-sync restore <rev|machine> [--dry-run]" >&2; exit 1; }
+  # A machine name restores that machine's latest backup.
+  sha=$(git -C "$REPO" rev-parse --verify -q "$rev^{commit}") \
+    || sha=$(latest_of_machine "$rev") \
+    || { echo "unknown backup or machine: $rev (see 'omarchy-sync machines')" >&2; exit 1; }
   short=$(git -C "$REPO" rev-parse --short "$sha")
+  from=$(machine_of "$sha")
   git -C "$REPO" cat-file -e "$sha:home" 2>/dev/null || { echo "backup $short has no home/ files" >&2; exit 1; }
+  echo "backup $short from machine '$from' -> this machine '$MACHINE'" >&2
 
   tmp=$(mktemp -d); trap 'rm -rf "$tmp"' RETURN
   git -C "$REPO" archive "$sha" home | tar -x -C "$tmp"
+  # Where the backup repo lives is this machine's business, not the backup's.
+  rm -f "$tmp/home/.config/omarchy-sync/config"
 
   if [ -n "$dry" ]; then
     rsync -ac -n --itemize-changes "$tmp/home/" "$HOME/" | grep -E '^>f' | awk '{print $2}'
@@ -352,10 +400,10 @@ cmd_restore() {
   herdr server reload-config >/dev/null 2>&1 || true
 
   n=$(missing_packages "$sha" | wc -l)
-  backup "restore: $short ($changed files)" >/dev/null
+  backup "restore: $short from $from ($changed files)" >/dev/null
   # restoreRev lets status report packages that backup had and this machine lacks.
-  write_state ok "Restored $short ($changed files)" "$(push_state)" "$(jq -n --arg r "$sha" '{restoreRev:$r}')"
-  echo "restored $short: $changed files"
+  write_state ok "Restored $short from $from ($changed files)" "$(push_state)" "$(jq -n --arg r "$sha" '{restoreRev:$r}')"
+  echo "restored $short from $from: $changed files"
   [ "$n" -gt 0 ] && echo "$n packages from that backup are not installed: run 'omarchy-sync restore-packages $short'"
   return 0
 }
@@ -529,9 +577,11 @@ cmd_restore_github() { # [owner/name] [path]: fresh machine -> GitHub sign-in ->
   [ -f "$path/sync.list" ] || { echo "$repo is not an omarchy-sync backup (no sync.list)" >&2; exit 1; }
 
   local revs choice rev
+  REPO="$path"
+  echo "Machines in this backup:"; cmd_machines | sed 's/^/  /'
   mapfile -t revs < <(git -C "$path" log -20 --format='%h')
-  echo "Which backup do you want on this machine?"
-  git -C "$path" log -20 --format='%h  %cd  %s' --date=format:'%Y-%m-%d %H:%M' | nl -w3 -s') '
+  echo "Which backup do you want on this machine ($MACHINE)?"
+  cmd_log 20 | nl -w3 -s') '
   choice=$(ask "Number" 1)
   rev=${revs[$((choice - 1))]:-}
   [ -n "$rev" ] || { echo "no backup number $choice" >&2; exit 1; }
@@ -539,7 +589,7 @@ cmd_restore_github() { # [owner/name] [path]: fresh machine -> GitHub sign-in ->
 
   cmd_setup "$path"
   if ! git -C "$path" diff --cached --quiet; then
-    git -C "$path" commit -q -m "restore: $rev on $(hostname)" && git -C "$path" push -q || true
+    git -C "$path" commit -q -m "restore: $rev from $(machine_of "$rev") on $MACHINE" --trailer "Machine: $MACHINE" && git -C "$path" push -q || true
   fi
   if [ -t 0 ]; then echo "Press Enter to close."; read -r _ || true; fi
 }
@@ -553,7 +603,8 @@ cmd_uninstall() {
 case "${1:-status}" in
   run) cmd_run ;;
   status) shift; cmd_status "${1:-}" ;;
-  log) shift; cmd_log "${1:-5}" ;;
+  log) shift; cmd_log "${1:-5}" "${2:-}" ;;
+  machines) cmd_machines ;;
   interval) shift; cmd_interval "${1:-}" ;;
   restore) shift; cmd_restore "$@" ;;
   restore-packages) shift; cmd_restore_packages "${1:-}" ;;
@@ -562,5 +613,5 @@ case "${1:-status}" in
   restore-github) shift; cmd_restore_github "$@" ;;
   install) cmd_install ;;
   uninstall) cmd_uninstall ;;
-  *) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  *) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac
