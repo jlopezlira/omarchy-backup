@@ -257,7 +257,26 @@ backup() {
 
 take_lock() { exec 9>"$LOCK"; flock -n 9 || { echo "a backup is already running" >&2; exit 3; }; }
 
-cmd_run() { need_repo; take_lock; backup "${1:-}"; }
+PLUGIN_DIR="$HOME/.config/omarchy/plugins/jj.backup-status"
+
+# Keep every machine on the latest tool and bar plugin: pull this tool's repo and, when it
+# moved, reinstall (plugin, units) and re-run with the new script. Local edits are left alone.
+self_update() { # args to re-run with
+  [ -z "${OMARCHY_SYNC_UPDATED:-}" ] || return 0
+  git -C "$TOOL" rev-parse --git-dir >/dev/null 2>&1 || return 0
+  if git -C "$TOOL" diff --quiet HEAD 2>/dev/null; then
+    local before; before=$(git -C "$TOOL" rev-parse HEAD)
+    if timeout 30 git -C "$TOOL" pull -q --ff-only 2>/dev/null && [ "$(git -C "$TOOL" rev-parse HEAD)" != "$before" ]; then
+      cmd_install >/dev/null
+      OMARCHY_SYNC_UPDATED=1 exec "$TOOL/bin/omarchy-sync" "$@"
+    fi
+  fi
+  # Pulled by hand but never installed: the bar would keep running the old plugin.
+  diff -rq "$TOOL/plugin/jj.backup-status" "$PLUGIN_DIR" >/dev/null 2>&1 \
+    || rsync -a --delete "$TOOL/plugin/jj.backup-status/" "$PLUGIN_DIR/"
+}
+
+cmd_run() { need_repo; self_update run "$@"; take_lock; backup "${1:-}"; }
 
 push_state() {
   cd "$REPO" || return
@@ -420,7 +439,7 @@ cmd_restore_packages() {
 }
 
 cmd_install() {
-  local pl="$HOME/.config/omarchy/plugins/jj.backup-status"
+  local pl="$PLUGIN_DIR"
   mkdir -p "$UNIT_DIR" "$HOME/.local/bin" "$pl"
   ln -sf "$TOOL/bin/omarchy-sync" "$HOME/.local/bin/omarchy-sync"
   cp "$TOOL/systemd/omarchy-sync.service" "$TOOL/systemd/omarchy-sync.timer" "$UNIT_DIR/"

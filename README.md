@@ -35,6 +35,10 @@ git clone https://github.com/jlopezlira/omarchy-backup ~/Projects/omarchy-backup
 
 It installs `gh` if needed, signs you in to GitHub in the browser, lists your private repos to pick the backup repo, clones it, and shows the machines it holds and the last 20 backups, each with the machine it came from, so you choose which one to apply. Each backup is named `backup: <date> · <host> · <apps that changed>`, its commit body lists every file, and a `Machine: <host>` trailer records where it was made (older backups fall back to the host in their `INVENTORY.md`). Then it runs `setup` (packages, files, tools, services, theme, this tool and the bar widget). If the widget is already installed, its first-run panel has a **Restore from GitHub** button that does the same. Finally follow the backup repo's `AGENTS.md`.
 
+## Updates
+
+Each `run` (the timer too) first pulls this tool's repo. When it moved, it reinstalls the bar plugin and the units and carries on with the new script, so every machine picks up fixes on its next backup. A clone with local edits is never pulled. The plugin is not part of the backups, so restoring an old backup cannot bring back an old plugin.
+
 ## Usage
 
 ```
