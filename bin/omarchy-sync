@@ -298,9 +298,11 @@ apply_packages() { # rev
   echo "packages: $(tr '\n' ' ' <<<"$pkgs")"
   native=$(comm -12 <(sort <<<"$pkgs") <(git -C "$REPO" show "$rev:pkgs/native.txt" 2>/dev/null | sort -u) | tr '\n' ' ')
   aur=$(comm -12 <(sort <<<"$pkgs") <(git -C "$REPO" show "$rev:pkgs/foreign.txt" 2>/dev/null | sort -u) | tr '\n' ' ')
+  # --asexplicit: a package that was already here as a dependency becomes explicit, as on the
+  # other machine, so both package lists (pacman -Qqe) end up the same.
   cmd="true"
-  [ -z "${native// }" ] || cmd="$cmd && sudo pacman -S --needed --noconfirm $native"
-  [ -z "${aur// }" ] || ! command -v yay >/dev/null || cmd="$cmd && yay -S --needed --noconfirm $aur"
+  [ -z "${native// }" ] || cmd="$cmd && sudo pacman -S --needed --noconfirm $native && sudo pacman -D -q --asexplicit $native"
+  [ -z "${aur// }" ] || ! command -v yay >/dev/null || cmd="$cmd && yay -S --needed --noconfirm $aur && sudo pacman -D -q --asexplicit $aur"
   run_as_root "Installing the packages the other machine has: $native$aur" "$cmd"
 }
 
@@ -905,10 +907,12 @@ pending_count() {
   rm -f "$list"; echo "${n:-0}"
 }
 
+# Packages the backup lists that are not explicitly installed here (one only here as a dependency
+# counts too: apply marks it explicit, so the two lists become the same).
 missing_packages() { # $1 = rev whose package list to compare with
   local rev="${1:-HEAD}"
-  comm -23 <(git -C "$REPO" show "$rev:pkgs/native.txt" 2>/dev/null | sort -u) <(pacman -Qqn | sort -u)
-  comm -23 <(git -C "$REPO" show "$rev:pkgs/foreign.txt" 2>/dev/null | sort -u) <(pacman -Qqm | sort -u)
+  comm -23 <(git -C "$REPO" show "$rev:pkgs/native.txt" 2>/dev/null | sort -u) <(pacman -Qqen | sort -u)
+  comm -23 <(git -C "$REPO" show "$rev:pkgs/foreign.txt" 2>/dev/null | sort -u) <(pacman -Qqem | sort -u)
 }
 
 cmd_status() {
