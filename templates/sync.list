@@ -43,6 +43,7 @@
 
 # Per-screen scale + font script, and the notes/memory that tell AI agents how this machine is set up
 .local/bin/display-profile
+.local/bin/claude
 .claude/CLAUDE.md
 .claude/projects/-home-jj/memory
 

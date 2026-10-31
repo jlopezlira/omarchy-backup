@@ -891,8 +891,14 @@ do_apply() { # [item...]
   backup "sync: applied ${from}'s configuration"
 }
 
+# Every git repository under the user's own folders is trusted for Claude Code, so it never asks
+# "do you trust this folder?" (trusting a parent folder does not cover the repos inside it).
+# ~/.local/bin/claude does the same, at once, for the folder it is started in.
+trust_own_folders() { "$TOOL/bin/omarchy-sync-trust" sweep >/dev/null 2>&1; }
+
 cmd_run() {
   need_repo; self_update run "$@"; take_lock
+  trust_own_folders
   pull_changes -s; local rc=$?
   if [ "$rc" = 10 ]; then
     if [ "$(config_value AUTO_APPLY)" = 1 ]; then do_apply; return; fi
@@ -1109,7 +1115,10 @@ cmd_install() {
   local pl="$PLUGIN_DIR"
   mkdir -p "$UNIT_DIR" "$HOME/.local/bin" "$pl"
   ln -sf "$TOOL/bin/omarchy-sync" "$HOME/.local/bin/omarchy-sync"
-  cp "$TOOL/systemd/omarchy-sync.service" "$TOOL/systemd/omarchy-sync.timer" "$UNIT_DIR/"
+  ln -sf "$TOOL/bin/omarchy-sync-trust" "$HOME/.local/bin/omarchy-sync-trust"
+  cp "$TOOL/systemd/omarchy-sync.service" "$TOOL/systemd/omarchy-sync.timer" "$TOOL/systemd/omarchy-sync-trust.service" "$UNIT_DIR/"
+  systemctl --user daemon-reload
+  systemctl --user enable -q omarchy-sync-trust.service 2>/dev/null; systemctl --user restart omarchy-sync-trust.service 2>/dev/null
   rsync -a --delete "$TOOL"/plugin/jj.backup-status/ "$pl/"
   [ -n "$(config_value REPO)" ] || set_config REPO "$REPO"
   systemctl --user daemon-reload
@@ -1284,8 +1293,9 @@ cmd_restore_github() { # [owner/name] [path]: fresh machine -> GitHub sign-in ->
 }
 
 cmd_uninstall() {
-  systemctl --user disable --now omarchy-sync.timer 2>/dev/null
-  rm -rf "$UNIT_DIR"/omarchy-sync.{service,timer} "$UNIT_DIR/omarchy-sync.timer.d" "$HOME/.local/bin/omarchy-sync"
+  systemctl --user disable --now omarchy-sync.timer omarchy-sync-trust.service 2>/dev/null
+  rm -rf "$UNIT_DIR"/omarchy-sync.{service,timer} "$UNIT_DIR/omarchy-sync-trust.service" "$UNIT_DIR/omarchy-sync.timer.d" \
+    "$HOME/.local/bin/omarchy-sync" "$HOME/.local/bin/omarchy-sync-trust"
   systemctl --user daemon-reload
 }
 

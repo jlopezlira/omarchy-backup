@@ -74,6 +74,10 @@ Every machine backs up into the same repo, and `run` first looks at what the oth
 - Per-machine files never travel: `hypr/monitors.lua`, `omarchy/shell.toml` (text size follows the screen) and `omarchy-sync/config`.
 - AI agents (Claude, Codex, Cursor, Grok, Pi) sync their instructions, hooks, skills, rules and MCP servers. Sign-ins, sessions and history do not.
 
+### No "do you trust this folder?"
+
+Claude Code asks that once per git repository (trusting `~/Work` covers only the plain folders inside it). Every repository under your home folder is your own, so `omarchy-sync-trust` marks them trusted in `~/.claude.json`: on every backup, the moment a repository appears (`git init`, a clone; a small user service watches `~/Work`, `~/Projects` and `~`), and when `claude` starts (`~/.local/bin/claude`, synced). Hidden folders and `~/Downloads` are left alone. The trusted list travels to the other machine with the Claude preferences.
+
 ### No secrets
 
 Credential files (`.credentials.json`, `auth.json`, keys, `.env`, `.npmrc`...) are never copied. Secret values inside synced configs (Bearer tokens, `api_key = "…"`, `sk-`/`ghp_` keys) are replaced by `REDACTED` in the committed copy only. When such a file is applied on another machine, each `REDACTED` value is filled from that machine's own copy of the same line; a value it never had stays `REDACTED` and `apply` says which file to fill in. A backup aborts if anything that looks like a secret is still about to be committed. `~/.claude.json` is never copied: only its preferences are recorded (`pkgs/claude-state.json`), never the account, IDs or caches.

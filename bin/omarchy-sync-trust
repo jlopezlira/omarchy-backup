@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Claude Code asks "do you trust this folder?" once per git repository: trusting ~/Work covers only
+# the plain folders inside it, not the repos. Every repository under $HOME is the user's own, so this
+# marks them trusted in ~/.claude.json before Claude can ask:
+#   omarchy-sync-trust sweep        every repository under $HOME now (omarchy-sync runs it on every backup)
+#   omarchy-sync-trust watch        keep watching ~/Work and ~/Projects: a repository that appears (git init, clone) is trusted at once
+#   omarchy-sync-trust here [dir]   the folder Claude is being started in, and its repository root
+# Hidden folders, ~/Downloads and anything outside $HOME stay as they are.
+set -uo pipefail
+CFG="$HOME/.claude.json"
+WATCH=("$HOME/Work" "$HOME/Projects")   # a repository straight under $HOME is covered by sweep and here
+
+own_folder() { # true when the folder is the user's own code
+  case "$1" in "$HOME"|"$HOME"/Downloads|"$HOME"/Downloads/*|"$HOME"/.*|/tmp/*) return 1 ;; "$HOME"/*) return 0 ;; *) return 1 ;; esac
+}
+
+trust() { # dir...
+  local d tmp
+  [ -f "$CFG" ] && command -v jq >/dev/null || return 0
+  for d in "$@"; do
+    own_folder "$d" || continue
+    jq -e --arg d "$d" '.projects[$d].hasTrustDialogAccepted == true' "$CFG" >/dev/null 2>&1 && continue
+    tmp=$(mktemp "$CFG.XXXXXX")
+    if jq --arg d "$d" '.projects[$d] = ({allowedTools: [], mcpContextUris: [], mcpServers: {}, enabledMcpjsonServers: [],
+          disabledMcpjsonServers: [], hasClaudeMdExternalIncludesApproved: false, hasClaudeMdExternalIncludesWarningShown: false}
+          + (.projects[$d] // {}) + {hasTrustDialogAccepted: true})' "$CFG" > "$tmp" 2>/dev/null; then
+      chmod --reference="$CFG" "$tmp"; mv -f "$tmp" "$CFG"     # atomic: Claude may be reading the file
+      echo "trusted: $d"
+    else
+      rm -f "$tmp"
+    fi
+  done
+}
+
+repos() { # every repository root under $HOME (hidden folders skipped), top-level ones included
+  find "$HOME" -maxdepth 5 \( -path "$HOME/.*" -o -path "$HOME/Downloads" -o -name node_modules \) -prune -o -type d -name .git -print 2>/dev/null \
+    | sed 's#/\.git$##'
+}
+
+case "${1:-}" in
+  sweep) trust $(repos) ;;
+  here)  d=$(cd "${2:-.}" 2>/dev/null && pwd -P) || exit 0
+         trust "$(git -C "$d" rev-parse --show-toplevel 2>/dev/null || echo "$d")" "$d" ;;
+  watch)
+    command -v inotifywait >/dev/null || { echo "inotifywait missing (inotify-tools)" >&2; exit 1; }
+    trust $(repos)
+    dirs=(); for d in "${WATCH[@]}"; do [ -d "$d" ] && dirs+=("$d"); done
+    [ ${#dirs[@]} -gt 0 ] || exit 0
+    # A new .git folder = a new repository (git init or clone): trust its parent right away. A folder
+    # that appears is checked again a moment later too, in case its .git arrived before the watch did.
+    inotifywait -m -r -q -e create -e moved_to --format '%w%f' --exclude '/(\.[^/]*|node_modules)/' "${dirs[@]}" 2>/dev/null \
+      | while IFS= read -r path; do
+          case "$(basename "$path")" in
+            .git) trust "$(dirname "$path")" ;;
+            .*) ;;
+            *) [ -d "$path" ] && { sleep 3; [ -d "$path/.git" ] && trust "$path"; } & ;;
+          esac
+        done ;;
+  *) sed -n '2,8p' "$0"; exit 1 ;;
+esac

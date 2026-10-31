@@ -1,0 +1,10 @@
+[Unit]
+Description=Trust every git repository under the home folder for Claude Code as soon as it appears
+
+[Service]
+ExecStart=%h/.local/bin/omarchy-sync-trust watch
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
