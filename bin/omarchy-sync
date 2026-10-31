@@ -116,7 +116,8 @@ referenced_files() {
         # Text files only: a referenced program (a symlink in ~/.local/bin, an AppImage, a mise
         # install) is documented in apps/, not copied.
         [ -f "$HOME/$rel" ] && [ ! -L "$HOME/$rel" ] && grep -qI '' "$HOME/$rel" || continue
-        case "$rel" in .cache/*|.local/state/*|.local/share/omarchy/*|.local/share/mise/*|.local/share/pnpm/*|*/node_modules/*|*/cache/*|.claude/projects/*|.claude/plugins/*|.git/*) continue ;; esac
+        # Agent conversations (pi's self-compact state lists its session files) are work, not config.
+        case "$rel" in .cache/*|.local/state/*|.local/share/omarchy/*|.local/share/mise/*|.local/share/pnpm/*|*/node_modules/*|*/cache/*|.claude/projects/*|.claude/plugins/*|.git/*|*/sessions/*|*.jsonl|*history*) continue ;; esac
         covered=""
         while IFS= read -r entry; do
           [[ -z "$entry" || "$entry" == \#* ]] && continue
