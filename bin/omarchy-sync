@@ -844,6 +844,9 @@ do_apply() { # [item...]
   git -C "$REPO" merge-base --is-ancestor HEAD "$rev" 2>/dev/null && git -C "$REPO" merge -q --ff-only "$rev" >/dev/null 2>&1
   remove_incoming "$SEL_FILES" "$SEL_EXTRAS"
   still_waiting && return 0
+  # The other machine may have pushed again while this answer was pending: ask about that too
+  # instead of backing up over it.
+  pull_changes -s; [ $? = 10 ] && { still_waiting; return 0; }
   backup "sync: applied ${from}'s configuration"
 }
 
