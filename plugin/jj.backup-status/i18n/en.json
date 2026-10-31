@@ -77,6 +77,7 @@
     "other": "%1 files changed"
   },
   "incoming.both": "changed here too",
+  "incoming.deleted": "removed there",
   "incoming.yes": "Apply",
   "incoming.no": "Skip",
   "incoming.more": "… and %1 more: omarchy-sync apply | skip <file>",

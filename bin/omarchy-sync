@@ -266,8 +266,25 @@ apply_extras() { # rev base
   want_extra claude-prefs && apply_claude_state "$rev"
   want_extra plugins && apply_claude_plugins "$rev"
   want_extra packages && apply_packages "$rev"
+  want_extra removals && apply_removals "$rev" "$base"
   want_extra software && apply_software "$rev"
   want_extra keyboard && apply_keyboard "$rev"
+}
+
+# Packages the other machine removed since the shared state that are still explicitly installed here
+removed_packages() { # rev base
+  { comm -23 <(git -C "$REPO" show "$2:pkgs/native.txt" 2>/dev/null | sort -u) <(git -C "$REPO" show "$1:pkgs/native.txt" 2>/dev/null | sort -u)
+    comm -23 <(git -C "$REPO" show "$2:pkgs/foreign.txt" 2>/dev/null | sort -u) <(git -C "$REPO" show "$1:pkgs/foreign.txt" 2>/dev/null | sort -u); } \
+    | sort -u | comm -12 - <(pacman -Qqe | sort -u)
+}
+
+# Remove them here too (with the dependencies nothing else needs), as the other machine did.
+apply_removals() { # rev base
+  local pkgs
+  pkgs=$(removed_packages "$1" "$2" | tr '\n' ' ')
+  [ -n "${pkgs// }" ] || return 0
+  echo "removing packages: $pkgs"
+  run_as_root "Removing the packages the other machine removed: $pkgs" "sudo pacman -Rs --noconfirm $pkgs"
 }
 
 # Global pnpm tools the backup has newer (or that are missing here): name<TAB>version
@@ -429,6 +446,7 @@ extras_diff() { # rev base
   [ -z "$look" ] || printf 'theme\t%s\n' "$look"
   if changed_upstream "$rev" "$base" pkgs/native.txt || changed_upstream "$rev" "$base" pkgs/foreign.txt; then
     n=$(missing_packages "$rev" | wc -l); [ "$n" -eq 0 ] || printf 'packages\t%s packages to install\n' "$n"
+    n=$(removed_packages "$rev" "$base" | tr '\n' ' '); [ -z "${n// }" ] || printf 'removals\tpackages removed on the other machine: %s\n' "${n% }"
   fi
   if command -v claude >/dev/null && changed_upstream "$rev" "$base" pkgs/claude-plugins.json && git -C "$REPO" cat-file -e "$rev:pkgs/claude-plugins.json" 2>/dev/null; then
     n=$(comm -23 <(git -C "$REPO" show "$rev:pkgs/claude-plugins.json" | jq -r '.plugins[]' | sort) \
@@ -683,7 +701,7 @@ fill_redacted() { # other-copy live
 # $1 = "" or "-n" (list only). Assumes the lock is held.
 # $1 = "" apply | "-n" list only | "-s" stage: write incoming.json and return 10 when there is something to ask about.
 pull_changes() {
-  local dry="${1:-}" stage="" up base from rel live stamp tmp mode note id label applied=0 kept=0 hypr=0 ff=0 files kept_files both_files extras
+  local dry="${1:-}" stage="" up base from st rel live stamp tmp mode note id label applied=0 kept=0 hypr=0 ff=0 files kept_files both_files deleted_files extras
   [ "$dry" != "-s" ] || { stage=1; dry="-n"; }
   if [ -n "${PULL_FROM:-}" ]; then   # explicit revision (pull --from): no fetch, no fast-forward
     up=$(git -C "$REPO" rev-parse -q --verify "$PULL_FROM^{commit}") || { echo "unknown revision: $PULL_FROM" >&2; return 1; }
@@ -699,16 +717,36 @@ pull_changes() {
   if [ -n "${PULL_BASE:-}" ]; then base=$(git -C "$REPO" rev-parse -q --verify "$PULL_BASE^{commit}") || { echo "unknown revision: $PULL_BASE" >&2; return 1; }
   else base=$(git -C "$REPO" merge-base HEAD "$up") || base=$(git -C "$REPO" hash-object -t tree /dev/null); fi
   from=$(machine_of "$up"); stamp=$(date +%Y%m%d-%H%M%S); tmp=$(mktemp)
-  LAST_UP=$up; LAST_BASE=$base; LAST_FROM=$from; files=""; kept_files=""; both_files=""
+  LAST_UP=$up; LAST_BASE=$base; LAST_FROM=$from; files=""; kept_files=""; both_files=""; deleted_files=""
   [ -n "${PULL_FROM:-}" ] || ! git -C "$REPO" merge-base --is-ancestor HEAD "$up" || ff=1
 
-  while IFS= read -r rel; do
+  while IFS=$'\t' read -r st rel; do
     rel=${rel#home/}
     case " ${MACHINE_LOCAL[*]} " in *" $rel "*) continue ;; esac
     [ -z "${ONLY_FILES+x}" ] || grep -qxF -- "$rel" <<<"$ONLY_FILES" || continue
     # Declined before ("Not now" on this very copy): stays out until the other machine changes it again.
-    [ -z "$stage" ] || [ "$(declined_blob "$rel")" != "$(git -C "$REPO" rev-parse -q "$up:home/$rel" 2>/dev/null)" ] || continue
+    [ -z "$stage" ] || [ "$(declined_blob "$rel")" != "$(git -C "$REPO" rev-parse -q "$up:home/$rel" 2>/dev/null || echo deleted)" ] || continue
     live="$HOME/$rel"
+    if [ "$st" = D ]; then                                  # removed on the other machine
+      [ -e "$live" ] && [ ! -L "$live" ] || continue
+      note=""
+      if git -C "$REPO" show "$base:home/$rel" 2>/dev/null | cmp -s - "$live"; then
+        :                                                   # untouched here since the shared state
+      elif [ "$(config_value CONFLICTS)" = mine ]; then
+        kept=$((kept + 1)); kept_files+="$rel"$'\n'; [ -n "$stage" ] || echo "keep local   $rel  (removed on $from, changed here)"
+        continue
+      else
+        note="  (changed here too; yours saved in conflicts/)"; both_files+="$rel"$'\n'
+        [ -n "$dry" ] || { mkdir -p "$STATE_DIR/conflicts/$stamp/$(dirname "$rel")"; cp -p "$live" "$STATE_DIR/conflicts/$stamp/$rel.mine"; }
+      fi
+      applied=$((applied + 1)); files+="$rel"$'\n'; deleted_files+="$rel"$'\n'
+      [ -n "$stage" ] || echo "removed on $from   $rel$note"
+      [ -n "$dry" ] && continue
+      mkdir -p "$STATE_DIR/overwritten/$stamp/$(dirname "$rel")"; cp -p "$live" "$STATE_DIR/overwritten/$stamp/$rel"
+      rm -f "$live"
+      case "$rel" in .config/hypr/*) hypr=1 ;; esac
+      continue
+    fi
     mode=$(git -C "$REPO" ls-tree "$up" "home/$rel" | cut -c1-6)
     [ "$mode" = 120000 ] && continue
     git -C "$REPO" show "$up:home/$rel" > "$tmp" 2>/dev/null || continue
@@ -740,7 +778,7 @@ pull_changes() {
     mkdir -p "$(dirname "$live")"; cat "$tmp" > "$live"
     [ "$mode" = 100755 ] && chmod +x "$live"
     case "$rel" in .config/hypr/*) hypr=1 ;; esac
-  done < <(git -C "$REPO" diff --name-only --diff-filter=AM "$base" "$up" -- home)
+  done < <(git -C "$REPO" diff --name-status --diff-filter=AMD "$base" "$up" -- home)
   rm -f "$tmp"
 
   if [ -n "$stage" ]; then
@@ -752,9 +790,10 @@ pull_changes() {
     jq -n --arg from "$from" --arg rev "$up" --arg base "$base" --arg time "$(date -Iseconds)" \
       --argjson files "$(printf '%s' "$files" | jq -R . | jq -s 'map(select(length>0))')" \
       --argjson both "$(printf '%s' "$both_files" | jq -R . | jq -s 'map(select(length>0))')" \
+      --argjson deleted "$(printf '%s' "$deleted_files" | jq -R . | jq -s 'map(select(length>0))')" \
       --argjson kept "$(printf '%s' "$kept_files" | jq -R . | jq -s 'map(select(length>0))')" \
       --argjson extras "$(printf '%s' "$extras" | jq -R 'split("\t") | select(length == 2) | {id: .[0], label: .[1]}' | jq -s .)" \
-      '{from:$from,rev:$rev,base:$base,time:$time,files:$files,both:$both,kept:$kept,extras:$extras}' > "$STATE_DIR/incoming.json"
+      '{from:$from,rev:$rev,base:$base,time:$time,files:$files,both:$both,deleted:$deleted,kept:$kept,extras:$extras}' > "$STATE_DIR/incoming.json"
     if [ "$(cat "$STATE_DIR/notified" 2>/dev/null)" != "$up" ]; then
       echo "$up" > "$STATE_DIR/notified"
       notify_incoming "$from" "$applied" "$(printf '%s' "$extras" | cut -f2 | head -1)"
@@ -787,7 +826,7 @@ cmd_pull() { # [--dry-run] [--from <rev>]
 # What was declined: declined.json = {files: {path: blob of the copy declined}, extras: {id: rev}}.
 declined_blob() { jq -r --arg f "$1" '.files[$f] // empty' "$STATE_DIR/declined.json" 2>/dev/null; }
 declined_extra() { jq -r --arg i "$1" '.extras[$i] // empty' "$STATE_DIR/declined.json" 2>/dev/null; }
-EXTRA_IDS="theme packages plugins claude-prefs software keyboard"
+EXTRA_IDS="theme packages removals plugins claude-prefs software keyboard"
 is_extra() { case " $EXTRA_IDS " in *" $1 "*) return 0 ;; esac; return 1; }
 
 # Split the items named on the command line into files (paths relative to $HOME) and extras (ids).
@@ -809,7 +848,7 @@ remove_incoming() { # files extras (newline lists)
   tmp=$(mktemp)
   jq --argjson f "$(printf '%s' "$1" | jq -R . | jq -s 'map(select(length>0))')" \
      --argjson e "$(printf '%s' "$2" | jq -R . | jq -s 'map(select(length>0))')" \
-     '.files -= $f | .both -= $f | .extras |= map(select([.id] | inside($e) | not))' "$inc" > "$tmp" && mv "$tmp" "$inc"
+     '.files -= $f | .both -= $f | .deleted -= $f | .extras |= map(select([.id] | inside($e) | not))' "$inc" > "$tmp" && mv "$tmp" "$inc"
   [ "$(jq '(.files|length) + (.extras|length)' "$inc")" = 0 ] && rm -f "$inc"
   return 0
 }
@@ -878,7 +917,7 @@ cmd_skip() { # [item...]
   tmp=$(mktemp)
   while IFS= read -r it; do
     [ -n "$it" ] || continue
-    jq --arg f "$it" --arg b "$(git -C "$REPO" rev-parse -q "$rev:home/$it" 2>/dev/null)" '.files[$f] = $b' "$dec" > "$tmp" && mv "$tmp" "$dec"
+    jq --arg f "$it" --arg b "$(git -C "$REPO" rev-parse -q "$rev:home/$it" 2>/dev/null || echo deleted)" '.files[$f] = $b' "$dec" > "$tmp" && mv "$tmp" "$dec"
   done <<<"$SEL_FILES"
   while IFS= read -r it; do
     [ -n "$it" ] || continue

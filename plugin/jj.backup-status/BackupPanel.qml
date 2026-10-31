@@ -43,9 +43,9 @@ Panel {
   // One row per change the user can apply or decline on its own: files first, then theme/packages/...
   readonly property var incomingItems: {
     if (!hasIncoming) return []
-    var both = incoming.both || [], out = []
-    ;(incoming.files || []).forEach(function(f) { out.push({ id: f, label: f, both: both.indexOf(f) >= 0 }) })
-    ;(incoming.extras || []).forEach(function(e) { out.push({ id: e.id, label: e.label, both: false }) })
+    var both = incoming.both || [], deleted = incoming.deleted || [], out = []
+    ;(incoming.files || []).forEach(function(f) { out.push({ id: f, label: f, both: both.indexOf(f) >= 0, deleted: deleted.indexOf(f) >= 0 }) })
+    ;(incoming.extras || []).forEach(function(e) { out.push({ id: e.id, label: e.label, both: false, deleted: false }) })
     return out
   }
   readonly property int incomingShown: 14
@@ -538,8 +538,10 @@ Panel {
                       Layout.fillWidth: true
                       textFormat: Text.PlainText
                       elide: Text.ElideMiddle
-                      text: modelData.label + (modelData.both ? "  · " + strings.t("incoming.both") : "")
-                      color: modelData.both ? root.foreground : root.dim
+                      text: modelData.label
+                            + (modelData.deleted ? "  · " + strings.t("incoming.deleted") : "")
+                            + (modelData.both ? "  · " + strings.t("incoming.both") : "")
+                      color: modelData.both || modelData.deleted ? root.foreground : root.dim
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.caption
                     }
