@@ -209,6 +209,8 @@ snapshot_software() {
   capture "$p/dconf.ini" dconf dump /
   capture "$p/claude-plugins.json" claude_plugins_json
   capture "$p/claude-state.json" claude_state_json
+  # System keyboard layout (localectl): fcitx5 derives its default layout from it, so both machines need the same
+  capture "$p/keyboard.txt" keyboard_now
   # Active theme and background (theme name, then the background's file name)
   capture "$p/omarchy-theme.txt" sh -c 'cat "$HOME/.local/state/omarchy/current/theme.name"; basename "$(readlink "$HOME/.local/state/omarchy/current/background")"'
   # Look toggles live in ~/.local/state, not ~/.config, so record the choices instead of the files
@@ -264,6 +266,7 @@ apply_extras() { # rev base
   want_extra plugins && apply_claude_plugins "$rev"
   want_extra packages && apply_packages "$rev"
   want_extra software && apply_software "$rev"
+  want_extra keyboard && apply_keyboard "$rev"
 }
 
 # Global pnpm tools the backup has newer (or that are missing here): name<TAB>version
@@ -297,14 +300,47 @@ apply_packages() { # rev
   cmd="true"
   [ -z "${native// }" ] || cmd="$cmd && sudo pacman -S --needed --noconfirm $native"
   [ -z "${aur// }" ] || ! command -v yay >/dev/null || cmd="$cmd && yay -S --needed --noconfirm $aur"
+  run_as_root "Installing the packages the other machine has: $native$aur" "$cmd"
+}
+
+# Run a command that needs sudo: here when this is a terminal, otherwise in a floating terminal
+# that asks for the password (the timer and the bar have no terminal of their own).
+run_as_root() { # title command
   if [ -t 0 ]; then
-    bash -c "$cmd" || echo "  some packages failed: $native$aur" >&2
+    bash -c "$2" || echo "  failed: $1" >&2
   elif command -v omarchy-launch-floating-terminal-with-presentation >/dev/null; then
-    omarchy-launch-floating-terminal-with-presentation "echo 'Installing the packages the other machine has:'; echo '  $native$aur'; $cmd" >/dev/null 2>&1 </dev/null &
+    omarchy-launch-floating-terminal-with-presentation "echo '$1'; $2" >/dev/null 2>&1 </dev/null &
     disown 2>/dev/null
   else
-    echo "  needs a terminal for the password: sudo pacman -S --needed $native$aur" >&2
+    echo "  needs a terminal for the password: $2" >&2
   fi
+}
+
+# System keyboard layout as "key=value" lines: X11 layout/variant/model and console keymap
+keyboard_now() {
+  command -v localectl >/dev/null || return 1
+  localectl status 2>/dev/null | sed -n 's/^ *VC Keymap: */vc=/p; s/^ *X11 Layout: */layout=/p; s/^ *X11 Variant: */variant=/p; s/^ *X11 Model: */model=/p'
+}
+
+keyboard_behind() { # rev -> "layout -> layout" when the backup's keyboard differs from this machine's
+  local want now
+  want=$(git -C "$REPO" show "$1:pkgs/keyboard.txt" 2>/dev/null) || return 0
+  now=$(keyboard_now) || return 0
+  [ "$want" = "$now" ] || echo "$(sed -n 's/^layout=//p' <<<"$now") -> $(sed -n 's/^layout=//p' <<<"$want")"
+}
+
+apply_keyboard() { # rev
+  local want layout variant model vc cmd="true"
+  [ -n "$(keyboard_behind "$1")" ] || return 0
+  want=$(git -C "$REPO" show "$1:pkgs/keyboard.txt" 2>/dev/null)
+  layout=$(sed -n 's/^layout=//p' <<<"$want"); variant=$(sed -n 's/^variant=//p' <<<"$want")
+  model=$(sed -n 's/^model=//p' <<<"$want"); vc=$(sed -n 's/^vc=//p' <<<"$want")
+  [ -z "$layout" ] || cmd="$cmd && sudo localectl set-x11-keymap '$layout' '$model' '$variant'"
+  [ -z "$vc" ] || cmd="$cmd && sudo localectl set-keymap '$vc'"
+  # fcitx5 reads the layout at start: restart it so the keyboard follows right away
+  cmd="$cmd && { fcitx5-remote -e 2>/dev/null; sleep 1; setsid -f fcitx5 -d >/dev/null 2>&1; true; }"
+  echo "keyboard: $(keyboard_behind "$1")"
+  run_as_root "Setting the keyboard layout like the other machine: $layout" "$cmd"
 }
 
 # mise tools the backup has newer: name<TAB>version (pkgs/mise.txt: name version source requested)
@@ -410,6 +446,9 @@ extras_diff() { # rev base
     n=$(mise_behind "$rev" | wc -l); [ "$n" -eq 0 ] || parts="${parts:+$parts, }$n mise tools"
   fi
   [ -z "$parts" ] || printf 'software\t%s to update\n' "$parts"
+  if changed_upstream "$rev" "$base" pkgs/keyboard.txt; then
+    n=$(keyboard_behind "$rev"); [ -z "$n" ] || printf 'keyboard\tkeyboard layout %s\n' "$n"
+  fi
 }
 
 # ---------- Inventory: software that does not come from pacman ----------
@@ -745,7 +784,7 @@ cmd_pull() { # [--dry-run] [--from <rev>]
 # What was declined: declined.json = {files: {path: blob of the copy declined}, extras: {id: rev}}.
 declined_blob() { jq -r --arg f "$1" '.files[$f] // empty' "$STATE_DIR/declined.json" 2>/dev/null; }
 declined_extra() { jq -r --arg i "$1" '.extras[$i] // empty' "$STATE_DIR/declined.json" 2>/dev/null; }
-EXTRA_IDS="theme packages plugins claude-prefs software"
+EXTRA_IDS="theme packages plugins claude-prefs software keyboard"
 is_extra() { case " $EXTRA_IDS " in *" $1 "*) return 0 ;; esac; return 1; }
 
 # Split the items named on the command line into files (paths relative to $HOME) and extras (ids).
